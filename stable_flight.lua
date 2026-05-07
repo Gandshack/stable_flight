@@ -272,6 +272,8 @@ local function stabilize()
             end
         elseif cmd == "speed" then
             showFlightMsg(string.format("Spd %+.1f  max %.1f blk/s", currentSpeed, maxAltSpeed), 60)
+        elseif cmd == "trim" then
+            showFlightMsg(string.format("Trim  P: %+.2f  R: %+.2f", config.pitchTrim, config.rollTrim), 60)
         elseif cmd:match("^target ") then
             local arg = cmd:match("^target (%S+)$")
             local n   = tonumber(arg)
