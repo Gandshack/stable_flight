@@ -195,8 +195,8 @@ local function stabilize()
 
     local targetAlt      = config.targetAlt or altimeter.getHeight()
     local landing        = false
-    local LAND_DIST      = 2.0      -- cut thrust when sensor reads this close
-    local DESCENT_RATE   = 0.3      -- blocks per tick to lower targetAlt when landing
+    local LAND_DIST      = 2.0 -- cut thrust when sensor reads this close
+    local DESCENT_RATE   = 0.3 -- blocks per tick to lower targetAlt when landing
     local flightMsg      = ""
     local flightMsgTicks = 0
 
@@ -209,6 +209,13 @@ local function stabilize()
     local lastAlt             = altimeter.getHeight()
     local firstTick           = true
     local accum               = { fl = 0, fr = 0, bl = 0, br = 0 }
+
+    -- Speed / climb tracking
+    local startTime           = os.clock()
+    local startAlt            = altimeter.getHeight()
+    local maxAltSpeed         = 0 -- blocks/sec
+    local currentSpeed        = 0 -- blocks/sec
+    local arrivedShown        = false
 
     local function dither(name, key, power)
         accum[key]  = accum[key] + power
@@ -236,6 +243,8 @@ local function stabilize()
         term.write(string.format("AErr : %+6.2f rate %+5.2f", altErr, altRate))
         term.setCursorPos(1, 8)
         term.write(string.format("AltCorr: %+5.2f", altCorr))
+        term.setCursorPos(1, 9)
+        term.write(string.format("Speed  : %+6.1f  max %5.1f blk/s", currentSpeed, maxAltSpeed))
         if dist then
             term.setCursorPos(1, 10)
             term.write(string.format("Sensor : %.2f blk", dist))
@@ -261,10 +270,18 @@ local function stabilize()
             else
                 landing = true
             end
+        elseif cmd == "speed" then
+            showFlightMsg(string.format("Spd %+.1f  max %.1f blk/s", currentSpeed, maxAltSpeed), 60)
         elseif cmd:match("^target ") then
             local arg = cmd:match("^target (%S+)$")
             local n   = tonumber(arg)
-            if n then targetAlt = n end
+            if n then
+                targetAlt    = n
+                startTime    = os.clock()
+                startAlt     = altimeter.getHeight()
+                maxAltSpeed  = 0
+                arrivedShown = false
+            end
         elseif cmd:match("^ptrim ") then
             local n = tonumber(cmd:match("^ptrim (%S+)$"))
             if n then
@@ -357,10 +374,16 @@ local function stabilize()
             rollRate  = roll - lastRoll
             altRate   = alt - lastAlt
         end
-        firstTick     = false
-        lastPitch     = pitch
-        lastRoll      = roll
-        lastAlt       = alt
+        firstTick    = false
+        lastPitch    = pitch
+        lastRoll     = roll
+        lastAlt      = alt
+
+        -- Speed tracking (altRate is per tick, *20 = blk/s at 20hz)
+        currentSpeed = altRate * 20
+        if math.abs(currentSpeed) > maxAltSpeed then
+            maxAltSpeed = math.abs(currentSpeed)
+        end
 
         local pc      = ((pitch - config.pitchTrim) * config.kP) + (pitchRate * config.kD)
         local rc      = ((roll - config.rollTrim) * config.kP) + (rollRate * config.kD)
@@ -371,15 +394,26 @@ local function stabilize()
             -config.altMax, config.altMax
         )
 
-        local fl      = clamp(config.hoverPower + altCorr - pc - rc, 0, 15)
-        local fr      = clamp(config.hoverPower + altCorr - pc + rc, 0, 15)
-        local bl      = clamp(config.hoverPower + altCorr + pc - rc, 0, 15)
-        local br      = clamp(config.hoverPower + altCorr + pc + rc, 0, 15)
+        -- Arrival detection: first time we get within 3 blocks of target
+        if not arrivedShown and not landing and math.abs(altErr) < 3 then
+            local elapsed = os.clock() - startTime
+            local dist    = math.abs(alt - startAlt)
+            showFlightMsg(
+                string.format("Arrived! %.1fs  %.0f blk  max %.1f blk/s", elapsed, dist, maxAltSpeed),
+                100
+            )
+            arrivedShown = true
+        end
 
-        local dFL     = dither(config.relays.front_left, "fl", fl)
-        local dFR     = dither(config.relays.front_right, "fr", fr)
-        local dBL     = dither(config.relays.back_left, "bl", bl)
-        local dBR     = dither(config.relays.back_right, "br", br)
+        local fl  = clamp(config.hoverPower + altCorr - pc - rc, 0, 15)
+        local fr  = clamp(config.hoverPower + altCorr - pc + rc, 0, 15)
+        local bl  = clamp(config.hoverPower + altCorr + pc - rc, 0, 15)
+        local br  = clamp(config.hoverPower + altCorr + pc + rc, 0, 15)
+
+        local dFL = dither(config.relays.front_left, "fl", fl)
+        local dFR = dither(config.relays.front_right, "fr", fr)
+        local dBL = dither(config.relays.back_left, "bl", bl)
+        local dBR = dither(config.relays.back_right, "br", br)
 
         -- Tick down the flight message
         if flightMsgTicks > 0 then
