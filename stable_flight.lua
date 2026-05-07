@@ -1,5 +1,5 @@
 -- stable_flight.lua
--- Flight stabilizer with PD attitude + altitude hold
+-- Flight stabilizer with PD attitude + altitude + velocity hold
 
 local CONFIG_FILE = "stable_flight.cfg"
 local POSITIONS   = { "front_left", "front_right", "back_left", "back_right" }
@@ -18,6 +18,10 @@ local config      = {
         back_left   = nil,
         back_right  = nil,
     },
+    velSensors = {
+        x = nil, -- peripheral name for X-axis (sideways) velocity
+        z = nil, -- peripheral name for Z-axis (forward/back) velocity
+    },
     side       = "top",
     hoverPower = 4.3,
     kP         = 0.2,
@@ -25,7 +29,13 @@ local config      = {
     altKP      = 0.5,
     altKD      = 2.0,
     altMax     = 4,
-    targetAlt  = nil, -- nil = use current altitude on start
+    targetAlt  = nil,
+    -- Velocity outer loop
+    velKP      = 5.0,  -- velocity error -> target lean angle (degrees)
+    velKD      = 2.0,  -- velocity rate damping
+    maxLean    = 20,   -- max angle (deg) the velocity loop can command
+    targetVelX = 0,
+    targetVelZ = 0,
 }
 
 local function saveConfig()
@@ -39,13 +49,18 @@ local function loadConfig()
     local f = fs.open(CONFIG_FILE, "r")
     local data = textutils.unserialize(f.readAll())
     f.close()
-    if data then
-        for k, v in pairs(data) do config[k] = v end
-    end
+    if data then for k, v in pairs(data) do config[k] = v end end
+    -- Migrations for old configs
     if config.kD == nil then config.kD = 1.0 end
     if config.altKP == nil then config.altKP = 0.5 end
     if config.altKD == nil then config.altKD = 2.0 end
     if config.altMax == nil then config.altMax = 4 end
+    if config.velKP == nil then config.velKP = 5.0 end
+    if config.velKD == nil then config.velKD = 2.0 end
+    if config.maxLean == nil then config.maxLean = 20 end
+    if config.targetVelX == nil then config.targetVelX = 0 end
+    if config.targetVelZ == nil then config.targetVelZ = 0 end
+    if config.velSensors == nil then config.velSensors = { x = nil, z = nil } end
 end
 
 loadConfig()
@@ -101,6 +116,21 @@ local function listRelays()
     return names
 end
 
+local function listVelSensors()
+    local names = {}
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "velocity_sensor" then
+            table.insert(names, name)
+        end
+    end
+    table.sort(names, function(a, b)
+        local na = tonumber(a:match("(%d+)$")) or 0
+        local nb = tonumber(b:match("(%d+)$")) or 0
+        return na < nb
+    end)
+    return names
+end
+
 -- ============================================================
 -- Stabilizer
 -- ============================================================
@@ -133,25 +163,30 @@ local function drawMain()
         term.write(string.format("  %-12s = %s", pos, config.relays[pos] or "<unset>"))
     end
 
+    term.setCursorPos(1, 8)
+    term.write("Velocity sensors:")
     term.setCursorPos(1, 9)
-    term.write(string.format("Hover power : %.2f", config.hoverPower))
+    term.write(string.format("  %-3s = %s", "x", config.velSensors.x or "<unset>"))
     term.setCursorPos(1, 10)
-    term.write(string.format("Tilt P/D    : %.2f / %.2f", config.kP, config.kD))
-    term.setCursorPos(1, 11)
-    term.write(string.format("Alt  P/D    : %.2f / %.2f", config.altKP, config.altKD))
-    term.setCursorPos(1, 12)
-    term.write(string.format("Alt max     : %d", config.altMax))
-    term.setCursorPos(1, 13)
-    if config.targetAlt then
-        term.write(string.format("Target alt  : %.2f", config.targetAlt))
-    else
-        term.write("Target alt  : <auto>")
-    end
-    term.setCursorPos(1, 14)
-    term.write(string.format("Output side : %s", config.side))
+    term.write(string.format("  %-3s = %s", "z", config.velSensors.z or "<unset>"))
 
-    term.setCursorPos(1, 16)
-    term.write("Type 'help' for commands.")
+    term.setCursorPos(1, 12)
+    term.write(string.format("Hover power : %.2f", config.hoverPower))
+    term.setCursorPos(1, 13)
+    term.write(string.format("Tilt P/D    : %.2f / %.2f", config.kP, config.kD))
+    term.setCursorPos(1, 14)
+    term.write(string.format("Alt  P/D    : %.2f / %.2f  max %d",
+        config.altKP, config.altKD, config.altMax))
+    term.setCursorPos(1, 15)
+    term.write(string.format("Vel  P/D    : %.2f / %.2f  lean %d",
+        config.velKP, config.velKD, config.maxLean))
+
+    term.setCursorPos(1, 17)
+    term.write(string.format("Target alt : %s",
+        config.targetAlt and string.format("%.2f", config.targetAlt) or "<auto>"))
+    term.setCursorPos(1, 18)
+    term.write(string.format("Target vel : x=%.2f  z=%.2f",
+        config.targetVelX, config.targetVelZ))
 
     term.redirect(term.native())
 end
@@ -159,28 +194,33 @@ end
 local function stabilize()
     local gimbal = findGimbal()
     if not gimbal then
-        status("No gimbal sensor found!", 2)
-        return
+        status("No gimbal sensor found!", 2); return
     end
 
     local altimeter = findAltimeter()
     if not altimeter then
-        status("No altitude sensor found!", 2)
+        status("No altitude sensor found!", 2); return
+    end
+
+    local velX, velZ
+    if config.velSensors.x then velX = peripheral.wrap(config.velSensors.x) end
+    if config.velSensors.z then velZ = peripheral.wrap(config.velSensors.z) end
+    if not velX or not velZ then
+        status("Velocity sensors not assigned! Use setvel.", 2)
         return
     end
 
     for pos, name in pairs(config.relays) do
         if not name then
-            status("'" .. pos .. "' not set!", 2)
-            return
+            status("'" .. pos .. "' not set!", 2); return
         end
     end
 
-    -- Use configured target or capture current altitude
     local targetAlt = config.targetAlt or altimeter.getHeight()
 
     local lastPitch, lastRoll = 0, 0
     local lastAlt = altimeter.getHeight()
+    local lastVX, lastVZ = velX.getVelocity(), velZ.getVelocity()
     local firstTick = true
 
     local accum = { fl = 0, fr = 0, bl = 0, br = 0 }
@@ -194,25 +234,27 @@ local function stabilize()
         return whole
     end
 
-    local function drawStat(pitch, roll, pRate, rRate, alt, altErr, altRate, altCorr,
+    local function drawStat(pitch, roll, alt, altErr, vx, vz, tgtPitch, tgtRoll,
                             dFL, dFR, dBL, dBR)
         term.redirect(mainWin)
         term.clear()
         term.setCursorPos(1, 1)
         term.write("=== STABILIZING ===")
         term.setCursorPos(1, 3)
-        term.write(string.format("Pitch: %7.2f rate %+5.2f", pitch, pRate))
+        term.write(string.format("Pitch: %7.2f tgt %+6.2f", pitch, tgtPitch))
         term.setCursorPos(1, 4)
-        term.write(string.format("Roll : %7.2f rate %+5.2f", roll, rRate))
+        term.write(string.format("Roll : %7.2f tgt %+6.2f", roll, tgtRoll))
         term.setCursorPos(1, 6)
         term.write(string.format("Alt  : %7.2f tgt %7.2f", alt, targetAlt))
         term.setCursorPos(1, 7)
-        term.write(string.format("AErr : %+6.2f rate %+5.2f", altErr, altRate))
-        term.setCursorPos(1, 8)
-        term.write(string.format("AltCorr: %+5.2f", altCorr))
+        term.write(string.format("AErr : %+6.2f", altErr))
+        term.setCursorPos(1, 9)
+        term.write(string.format("VelX : %+6.2f tgt %+5.2f", vx, config.targetVelX))
         term.setCursorPos(1, 10)
+        term.write(string.format("VelZ : %+6.2f tgt %+5.2f", vz, config.targetVelZ))
+        term.setCursorPos(1, 12)
         term.write("Sent (FL FR BL BR):")
-        term.setCursorPos(1, 11)
+        term.setCursorPos(1, 13)
         term.write(string.format("  %2d  %2d  %2d  %2d", dFL, dFR, dBL, dBR))
         term.redirect(cmdWin)
         term.clear()
@@ -226,51 +268,77 @@ local function stabilize()
         while true do
             local event, p1 = os.pullEvent()
             if event == "key" then
-                allOff()
-                status("Stopped.", 1)
-                return
+                allOff(); status("Stopped.", 1); return
             elseif event == "timer" and p1 == timer then
                 break
             end
         end
 
-        local angles                       = gimbal.getAngles()
-        local roll                         = -angles[1]
-        local pitch                        = angles[2]
-        local alt                          = altimeter.getHeight()
+        -- Read sensors
+        local angles                                       = gimbal.getAngles()
+        local roll                                         = -angles[1]
+        local pitch                                        = angles[2]
+        local alt                                          = altimeter.getHeight()
+        local vx                                           = velX.getVelocity()
+        local vz                                           = velZ.getVelocity()
 
-        local pitchRate, rollRate, altRate = 0, 0, 0
+        -- Rates
+        local pitchRate, rollRate, altRate, vxRate, vzRate = 0, 0, 0, 0, 0
         if not firstTick then
             pitchRate = pitch - lastPitch
             rollRate  = roll - lastRoll
             altRate   = alt - lastAlt
+            vxRate    = vx - lastVX
+            vzRate    = vz - lastVZ
         end
-        firstTick     = false
-        lastPitch     = pitch
-        lastRoll      = roll
-        lastAlt       = alt
+        firstTick      = false
+        lastPitch      = pitch; lastRoll = roll; lastAlt = alt
+        lastVX         = vx; lastVZ = vz
 
-        local pc      = (pitch * config.kP) + (pitchRate * config.kD)
-        local rc      = (roll * config.kP) + (rollRate * config.kD)
+        -- ===== OUTER LOOP: velocity -> target attitude =====
+        -- Velocity error -> desired lean angle
+        -- To accelerate +X, we need to roll a certain way; to accelerate +Z, pitch.
+        -- Sign convention guess: positive vel error -> positive lean.
+        -- If craft accelerates wrong way, flip sign of velKP/velKD or swap sensor axes.
+        local vxErr    = config.targetVelX - vx
+        local vzErr    = config.targetVelZ - vz
 
-        local altErr  = targetAlt - alt
-        local altCorr = clamp(
+        local tgtRoll  = clamp(
+            (vxErr * config.velKP) - (vxRate * config.velKD),
+            -config.maxLean, config.maxLean
+        )
+        local tgtPitch = clamp(
+            (vzErr * config.velKP) - (vzRate * config.velKD),
+            -config.maxLean, config.maxLean
+        )
+
+        -- ===== INNER LOOP: attitude -> thrust =====
+        -- Note: error = current - target (not target - current), so when at-target the correction is zero
+        local pitchErr = pitch - tgtPitch
+        local rollErr  = roll - tgtRoll
+
+        local pc       = (pitchErr * config.kP) + (pitchRate * config.kD)
+        local rc       = (rollErr * config.kP) + (rollRate * config.kD)
+
+        -- ===== ALTITUDE LOOP =====
+        local altErr   = targetAlt - alt
+        local altCorr  = clamp(
             (altErr * config.altKP) - (altRate * config.altKD),
             -config.altMax, config.altMax
         )
 
-        local fl      = clamp(config.hoverPower + altCorr - pc - rc, 0, 15)
-        local fr      = clamp(config.hoverPower + altCorr - pc + rc, 0, 15)
-        local bl      = clamp(config.hoverPower + altCorr + pc - rc, 0, 15)
-        local br      = clamp(config.hoverPower + altCorr + pc + rc, 0, 15)
+        -- ===== MIX =====
+        local fl       = clamp(config.hoverPower + altCorr - pc - rc, 0, 15)
+        local fr       = clamp(config.hoverPower + altCorr - pc + rc, 0, 15)
+        local bl       = clamp(config.hoverPower + altCorr + pc - rc, 0, 15)
+        local br       = clamp(config.hoverPower + altCorr + pc + rc, 0, 15)
 
-        local dFL     = dither(config.relays.front_left, "fl", fl)
-        local dFR     = dither(config.relays.front_right, "fr", fr)
-        local dBL     = dither(config.relays.back_left, "bl", bl)
-        local dBR     = dither(config.relays.back_right, "br", br)
+        local dFL      = dither(config.relays.front_left, "fl", fl)
+        local dFR      = dither(config.relays.front_right, "fr", fr)
+        local dBL      = dither(config.relays.back_left, "bl", bl)
+        local dBR      = dither(config.relays.back_right, "br", br)
 
-        drawStat(pitch, roll, pitchRate, rollRate, alt, altErr, altRate, altCorr,
-            dFL, dFR, dBL, dBR)
+        drawStat(pitch, roll, alt, altErr, vx, vz, tgtPitch, tgtRoll, dFL, dFR, dBL, dBR)
     end
 end
 
@@ -280,23 +348,29 @@ end
 local function showHelp()
     local lines = {
         "Commands:",
-        "  q, quit          - exit program",
-        "  help             - show this help",
-        "  list             - list available relays",
-        "  show             - show current config",
-        "  perf             - list all peripherals",
-        "  set <pos> <num>  - assign relay to position",
-        "  pulse <pos>      - test a position",
-        "  power <num>      - set hover power (decimals OK)",
-        "  gain <num>       - set tilt P gain",
-        "  dgain <num>      - set tilt D gain",
-        "  altgain <num>    - set altitude P gain",
-        "  altdgain <num>   - set altitude D gain",
-        "  altmax <num>     - max altitude correction",
-        "  target <Y>       - set target altitude",
-        "  target auto      - capture altitude on start",
-        "  side <side>      - set output side",
-        "  start            - start stabilizer",
+        "  q, quit            - exit",
+        "  help               - this help",
+        "  list               - list relays",
+        "  vlist              - list velocity sensors",
+        "  perf               - list all peripherals",
+        "  set <pos> <num>    - assign relay",
+        "  setvel <axis> <n>  - assign vel sensor (axis=x|z)",
+        "  pulse <pos>        - test thruster",
+        "  power <num>        - hover power (decimals OK)",
+        "  gain <num>         - tilt P gain",
+        "  dgain <num>        - tilt D gain",
+        "  altgain <num>      - alt P gain",
+        "  altdgain <num>     - alt D gain",
+        "  altmax <num>       - max alt correction",
+        "  velgain <num>      - vel P gain",
+        "  veldgain <num>     - vel D gain",
+        "  maxlean <num>      - max lean angle (deg)",
+        "  target <Y>|auto    - target altitude",
+        "  velx <num>         - target X velocity",
+        "  velz <num>         - target Z velocity",
+        "  hover              - velx 0, velz 0",
+        "  side <side>        - relay output side",
+        "  start              - run stabilizer",
         "",
         "Press any key to return...",
     }
@@ -310,35 +384,24 @@ local function showHelp()
     os.pullEvent("key")
 end
 
-local function showRelays()
-    local relays = listRelays()
-    if #relays == 0 then
-        status("No relays found on the network.", 2)
-        return
+local function showScrollList(title, items, render)
+    if #items == 0 then
+        status("Nothing to show.", 2); return
     end
 
     local offset = 0
-    local maxOff = math.max(0, #relays - (h - 2))
-
-    local assigned = {}
-    for pos, name in pairs(config.relays) do
-        if name then assigned[name] = pos end
-    end
+    local maxOff = math.max(0, #items - (h - 2))
 
     local function draw()
         term.redirect(mainWin)
         term.clear()
         term.setCursorPos(1, 1)
-        term.write(string.format("Relays (%d)  (* = assigned)", #relays))
+        term.write(title)
         for y = 2, h - 1 do
             local idx = y - 1 + offset
-            local name = relays[idx]
+            local item = items[idx]
             term.setCursorPos(1, y)
-            if name then
-                local marker = assigned[name] and "*" or " "
-                local label = assigned[name] and (" -> " .. assigned[name]) or ""
-                term.write(string.format("%s%2d. %s%s", marker, idx, name, label))
-            end
+            if item then term.write(render(item, idx)) end
         end
         term.redirect(cmdWin)
         term.clear()
@@ -359,51 +422,50 @@ local function showRelays()
     end
 end
 
+local function showRelays()
+    local relays = listRelays()
+    local assigned = {}
+    for pos, name in pairs(config.relays) do
+        if name then assigned[name] = pos end
+    end
+    showScrollList(
+        string.format("Relays (%d)  (* = assigned)", #relays),
+        relays,
+        function(name, idx)
+            local marker = assigned[name] and "*" or " "
+            local label = assigned[name] and (" -> " .. assigned[name]) or ""
+            return string.format("%s%2d. %s%s", marker, idx, name, label)
+        end
+    )
+end
+
+local function showVelSensors()
+    local sensors = listVelSensors()
+    local assigned = {}
+    if config.velSensors.x then assigned[config.velSensors.x] = "x" end
+    if config.velSensors.z then assigned[config.velSensors.z] = "z" end
+    showScrollList(
+        string.format("Velocity sensors (%d)  (* = assigned)", #sensors),
+        sensors,
+        function(name, idx)
+            local marker = assigned[name] and "*" or " "
+            local label = assigned[name] and (" -> " .. assigned[name]) or ""
+            return string.format("%s%2d. %s%s", marker, idx, name, label)
+        end
+    )
+end
+
 local function listPeripherals()
     local all = {}
     for _, name in ipairs(peripheral.getNames()) do
         table.insert(all, { name = name, ptype = peripheral.getType(name) })
     end
     table.sort(all, function(a, b) return a.name < b.name end)
-
-    if #all == 0 then
-        status("No peripherals found!", 2)
-        return
-    end
-
-    local offset = 0
-    local maxOff = math.max(0, #all - (h - 2))
-
-    local function draw()
-        term.redirect(mainWin)
-        term.clear()
-        term.setCursorPos(1, 1)
-        term.write(string.format("All peripherals (%d)", #all))
-        for y = 2, h - 1 do
-            local idx = y - 1 + offset
-            local entry = all[idx]
-            term.setCursorPos(1, y)
-            if entry then
-                term.write(string.format("  %s [%s]", entry.name, entry.ptype or "?"))
-            end
-        end
-        term.redirect(cmdWin)
-        term.clear()
-        term.setCursorPos(1, 1)
-        term.write("Scroll or press any key...")
-        term.redirect(term.native())
-    end
-
-    draw()
-    while true do
-        local event, p1 = os.pullEvent()
-        if event == "mouse_scroll" then
-            offset = math.max(0, math.min(offset + p1, maxOff))
-            draw()
-        elseif event == "key" then
-            return
-        end
-    end
+    showScrollList(
+        string.format("All peripherals (%d)", #all),
+        all,
+        function(e, idx) return string.format("  %s [%s]", e.name, e.ptype or "?") end
+    )
 end
 
 -- ============================================================
@@ -413,12 +475,22 @@ local function setRelay(pos, num)
     local relays = listRelays()
     local relay = relays[num]
     if not relay then
-        status("No relay #" .. tostring(num), 2)
-        return
+        status("No relay #" .. tostring(num), 2); return
     end
     config.relays[pos] = relay
     saveConfig()
     status("Set " .. pos .. " = " .. relay, 1)
+end
+
+local function setVelSensor(axis, num)
+    local sensors = listVelSensors()
+    local sensor = sensors[num]
+    if not sensor then
+        status("No vel sensor #" .. tostring(num), 2); return
+    end
+    config.velSensors[axis] = sensor
+    saveConfig()
+    status("Set vel " .. axis .. " = " .. sensor, 1)
 end
 
 local function pulse(pos)
@@ -437,6 +509,14 @@ local function pulse(pos)
     status("Done.", 1)
 end
 
+local function setNumberConfig(key, n, label)
+    if n then
+        config[key] = n; saveConfig(); status(label .. ": " .. n, 1)
+    else
+        status("Need a number", 2)
+    end
+end
+
 local function handleCommand(cmd)
     if cmd == "q" or cmd == "quit" then
         term.clear(); term.setCursorPos(1, 1); return false
@@ -444,12 +524,16 @@ local function handleCommand(cmd)
         showHelp()
     elseif cmd == "list" then
         showRelays()
-    elseif cmd == "show" then
-        status("Config shown above.", 1)
+    elseif cmd == "vlist" then
+        showVelSensors()
     elseif cmd == "perf" then
         listPeripherals()
     elseif cmd == "start" then
         stabilize()
+    elseif cmd == "hover" then
+        config.targetVelX = 0; config.targetVelZ = 0
+        saveConfig()
+        status("Hover targets set (vel x=0 z=0)", 1)
     elseif cmd:match("^set ") then
         local a, b = cmd:match("^set (%S+) (%S+)$")
         local num = tonumber(b)
@@ -460,6 +544,16 @@ local function handleCommand(cmd)
         else
             setRelay(a, num)
         end
+    elseif cmd:match("^setvel ") then
+        local a, b = cmd:match("^setvel (%S+) (%S+)$")
+        local num = tonumber(b)
+        if a ~= "x" and a ~= "z" then
+            status("Axis must be x or z", 2)
+        elseif not num then
+            status("Need a number. Use 'vlist'.", 2)
+        else
+            setVelSensor(a, num)
+        end
     elseif cmd:match("^pulse ") then
         local a = cmd:match("^pulse (%S+)$")
         if not a or not isValidPosition(a) then
@@ -468,60 +562,36 @@ local function handleCommand(cmd)
             pulse(a)
         end
     elseif cmd:match("^power ") then
-        local n = tonumber(cmd:match("^power (%S+)$"))
-        if n then
-            config.hoverPower = clamp(n, 0, 15); saveConfig()
-            status("Hover power: " .. string.format("%.2f", config.hoverPower), 1)
-        else
-            status("Usage: power 0-15", 2)
-        end
+        setNumberConfig("hoverPower", tonumber(cmd:match("^power (%S+)$")), "Hover power")
     elseif cmd:match("^gain ") then
-        local n = tonumber(cmd:match("^gain (%S+)$"))
-        if n then
-            config.kP = n; saveConfig(); status("kP: " .. n, 1)
-        else
-            status("Usage: gain <number>", 2)
-        end
+        setNumberConfig("kP", tonumber(cmd:match("^gain (%S+)$")), "kP")
     elseif cmd:match("^dgain ") then
-        local n = tonumber(cmd:match("^dgain (%S+)$"))
-        if n then
-            config.kD = n; saveConfig(); status("kD: " .. n, 1)
-        else
-            status("Usage: dgain <number>", 2)
-        end
+        setNumberConfig("kD", tonumber(cmd:match("^dgain (%S+)$")), "kD")
     elseif cmd:match("^altgain ") then
-        local n = tonumber(cmd:match("^altgain (%S+)$"))
-        if n then
-            config.altKP = n; saveConfig(); status("altKP: " .. n, 1)
-        else
-            status("Usage: altgain <number>", 2)
-        end
+        setNumberConfig("altKP", tonumber(cmd:match("^altgain (%S+)$")), "altKP")
     elseif cmd:match("^altdgain ") then
-        local n = tonumber(cmd:match("^altdgain (%S+)$"))
-        if n then
-            config.altKD = n; saveConfig(); status("altKD: " .. n, 1)
-        else
-            status("Usage: altdgain <number>", 2)
-        end
+        setNumberConfig("altKD", tonumber(cmd:match("^altdgain (%S+)$")), "altKD")
     elseif cmd:match("^altmax ") then
-        local n = tonumber(cmd:match("^altmax (%S+)$"))
-        if n then
-            config.altMax = n; saveConfig(); status("altMax: " .. n, 1)
-        else
-            status("Usage: altmax <number>", 2)
-        end
+        setNumberConfig("altMax", tonumber(cmd:match("^altmax (%S+)$")), "altMax")
+    elseif cmd:match("^velgain ") then
+        setNumberConfig("velKP", tonumber(cmd:match("^velgain (%S+)$")), "velKP")
+    elseif cmd:match("^veldgain ") then
+        setNumberConfig("velKD", tonumber(cmd:match("^veldgain (%S+)$")), "velKD")
+    elseif cmd:match("^maxlean ") then
+        setNumberConfig("maxLean", tonumber(cmd:match("^maxlean (%S+)$")), "maxLean")
+    elseif cmd:match("^velx ") then
+        setNumberConfig("targetVelX", tonumber(cmd:match("^velx (%S+)$")), "targetVelX")
+    elseif cmd:match("^velz ") then
+        setNumberConfig("targetVelZ", tonumber(cmd:match("^velz (%S+)$")), "targetVelZ")
     elseif cmd:match("^target ") then
         local arg = cmd:match("^target (%S+)$")
         if arg == "auto" then
-            config.targetAlt = nil
-            saveConfig()
-            status("Target: auto (use current alt on start)", 1)
+            config.targetAlt = nil; saveConfig()
+            status("Target: auto", 1)
         else
             local n = tonumber(arg)
             if n then
-                config.targetAlt = n
-                saveConfig()
-                status("Target altitude: " .. n, 1)
+                config.targetAlt = n; saveConfig(); status("Target alt: " .. n, 1)
             else
                 status("Usage: target <Y> | target auto", 2)
             end
