@@ -193,10 +193,17 @@ local function stabilize()
         end
     end
 
-    local targetAlt           = config.targetAlt or altimeter.getHeight()
-    local landing             = false
-    local LAND_DIST           = 2.0 -- cut thrust when sensor reads this close
-    local DESCENT_RATE        = 0.3 -- blocks per tick to lower targetAlt when landing
+    local targetAlt      = config.targetAlt or altimeter.getHeight()
+    local landing        = false
+    local LAND_DIST      = 2.0      -- cut thrust when sensor reads this close
+    local DESCENT_RATE   = 0.3      -- blocks per tick to lower targetAlt when landing
+    local flightMsg      = ""
+    local flightMsgTicks = 0
+
+    local function showFlightMsg(msg, ticks)
+        flightMsg      = msg
+        flightMsgTicks = ticks or 20 -- default ~1 second at 20hz
+    end
 
     local lastPitch, lastRoll = 0, 0
     local lastAlt             = altimeter.getHeight()
@@ -233,6 +240,10 @@ local function stabilize()
             term.setCursorPos(1, 10)
             term.write(string.format("Sensor : %.2f blk", dist))
         end
+        if flightMsg ~= "" then
+            term.setCursorPos(1, 11)
+            term.write(flightMsg)
+        end
         term.setCursorPos(1, 12)
         term.write("Sent (FL FR BL BR):")
         term.setCursorPos(1, 13)
@@ -246,7 +257,7 @@ local function stabilize()
             return "stop"
         elseif cmd == "land" then
             if not sensor then
-                status("No optical sensor found!", 1)
+                showFlightMsg("No optical sensor!", 30)
             else
                 landing = true
             end
@@ -369,6 +380,12 @@ local function stabilize()
         local dFR     = dither(config.relays.front_right, "fr", fr)
         local dBL     = dither(config.relays.back_left, "bl", bl)
         local dBR     = dither(config.relays.back_right, "br", br)
+
+        -- Tick down the flight message
+        if flightMsgTicks > 0 then
+            flightMsgTicks = flightMsgTicks - 1
+            if flightMsgTicks == 0 then flightMsg = "" end
+        end
 
         drawStat(pitch, roll, pitchRate, rollRate, alt, altErr, altRate, altCorr,
             dFL, dFR, dBL, dBR)
