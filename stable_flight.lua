@@ -8,3 +8,5 @@ end
 for i, name in ipairs(peripherals) do
     print(i, name)
 end
+
+print("TEST")
