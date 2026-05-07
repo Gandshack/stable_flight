@@ -90,6 +90,10 @@ local function findAltimeter()
     return peripheral.find("altitude_sensor")
 end
 
+local function findOpticalSensor()
+    return peripheral.find("optical_sensor")
+end
+
 local function listRelays()
     local names = {}
     for _, name in ipairs(peripheral.getNames()) do
@@ -160,50 +164,61 @@ local function drawMain()
     term.redirect(term.native())
 end
 
+local cmdInput = ""
+
+local function drawPrompt()
+    term.redirect(cmdWin)
+    term.clear()
+    term.setCursorPos(1, 1)
+    term.write(">" .. cmdInput)
+    term.redirect(term.native())
+end
+
 local function stabilize()
     local gimbal = findGimbal()
     if not gimbal then
-        status("No gimbal sensor found!", 2)
-        return
+        status("No gimbal sensor found!", 2); return
     end
 
     local altimeter = findAltimeter()
     if not altimeter then
-        status("No altitude sensor found!", 2)
-        return
+        status("No altitude sensor found!", 2); return
     end
+
+    local sensor = findOpticalSensor() -- optional, needed for landing
 
     for pos, name in pairs(config.relays) do
         if not name then
-            status("'" .. pos .. "' not set!", 2)
-            return
+            status("'" .. pos .. "' not set!", 2); return
         end
     end
 
-    -- Use configured target or capture current altitude
-    local targetAlt = config.targetAlt or altimeter.getHeight()
+    local targetAlt           = config.targetAlt or altimeter.getHeight()
+    local landing             = false
+    local LAND_DIST           = 2.0 -- cut thrust when sensor reads this close
+    local DESCENT_RATE        = 0.3 -- blocks per tick to lower targetAlt when landing
 
     local lastPitch, lastRoll = 0, 0
-    local lastAlt = altimeter.getHeight()
-    local firstTick = true
-
-    local accum = { fl = 0, fr = 0, bl = 0, br = 0 }
+    local lastAlt             = altimeter.getHeight()
+    local firstTick           = true
+    local accum               = { fl = 0, fr = 0, bl = 0, br = 0 }
 
     local function dither(name, key, power)
-        accum[key] = accum[key] + power
+        accum[key]  = accum[key] + power
         local whole = math.floor(accum[key] + 0.5)
-        accum[key] = accum[key] - whole
-        whole = clamp(whole, 0, 15)
+        accum[key]  = accum[key] - whole
+        whole       = clamp(whole, 0, 15)
         setRawThrust(name, whole)
         return whole
     end
 
     local function drawStat(pitch, roll, pRate, rRate, alt, altErr, altRate, altCorr,
                             dFL, dFR, dBL, dBR)
+        local dist = sensor and sensor.getDistance() or nil
         term.redirect(mainWin)
         term.clear()
         term.setCursorPos(1, 1)
-        term.write("=== STABILIZING ===")
+        term.write(landing and "=== LANDING ===" or "=== STABILIZING ===")
         term.setCursorPos(1, 3)
         term.write(string.format("Pitch: %7.2f rate %+5.2f", pitch, pRate))
         term.setCursorPos(1, 4)
@@ -214,28 +229,110 @@ local function stabilize()
         term.write(string.format("AErr : %+6.2f rate %+5.2f", altErr, altRate))
         term.setCursorPos(1, 8)
         term.write(string.format("AltCorr: %+5.2f", altCorr))
-        term.setCursorPos(1, 10)
+        if dist then
+            term.setCursorPos(1, 10)
+            term.write(string.format("Sensor : %.2f blk", dist))
+        end
+        term.setCursorPos(1, 12)
         term.write("Sent (FL FR BL BR):")
-        term.setCursorPos(1, 11)
+        term.setCursorPos(1, 13)
         term.write(string.format("  %2d  %2d  %2d  %2d", dFL, dFR, dBL, dBR))
-        term.redirect(cmdWin)
-        term.clear()
-        term.setCursorPos(1, 1)
-        term.write("Press any key to stop")
         term.redirect(term.native())
     end
+
+    -- Commands available while flying
+    local function handleFlightCmd(cmd)
+        if cmd == "stop" or cmd == "q" or cmd == "quit" then
+            return "stop"
+        elseif cmd == "land" then
+            if not sensor then
+                status("No optical sensor found!", 1)
+            else
+                landing = true
+            end
+        elseif cmd:match("^target ") then
+            local arg = cmd:match("^target (%S+)$")
+            local n   = tonumber(arg)
+            if n then targetAlt = n end
+        elseif cmd:match("^ptrim ") then
+            local n = tonumber(cmd:match("^ptrim (%S+)$"))
+            if n then
+                config.pitchTrim = n; saveConfig()
+            end
+        elseif cmd:match("^rtrim ") then
+            local n = tonumber(cmd:match("^rtrim (%S+)$"))
+            if n then
+                config.rollTrim = n; saveConfig()
+            end
+        elseif cmd:match("^power ") then
+            local n = tonumber(cmd:match("^power (%S+)$"))
+            if n then
+                config.hoverPower = clamp(n, 0, 15); saveConfig()
+            end
+        elseif cmd:match("^gain ") then
+            local n = tonumber(cmd:match("^gain (%S+)$"))
+            if n then
+                config.kP = n; saveConfig()
+            end
+        elseif cmd:match("^dgain ") then
+            local n = tonumber(cmd:match("^dgain (%S+)$"))
+            if n then
+                config.kD = n; saveConfig()
+            end
+        elseif cmd:match("^altgain ") then
+            local n = tonumber(cmd:match("^altgain (%S+)$"))
+            if n then
+                config.altKP = n; saveConfig()
+            end
+        elseif cmd:match("^altdgain ") then
+            local n = tonumber(cmd:match("^altdgain (%S+)$"))
+            if n then
+                config.altKD = n; saveConfig()
+            end
+        elseif cmd:match("^altmax ") then
+            local n = tonumber(cmd:match("^altmax (%S+)$"))
+            if n then
+                config.altMax = n; saveConfig()
+            end
+        end
+        return "continue"
+    end
+
+    drawPrompt()
 
     while true do
         local timer = os.startTimer(0.05)
         while true do
             local event, p1 = os.pullEvent()
-            if event == "key" then
-                allOff()
-                status("Stopped.", 1)
-                return
+            if event == "char" then
+                cmdInput = cmdInput .. p1
+                drawPrompt()
+            elseif event == "key" then
+                if p1 == keys.enter then
+                    local result = handleFlightCmd(cmdInput)
+                    cmdInput = ""
+                    if result == "stop" then
+                        allOff(); status("Stopped.", 1); return
+                    end
+                    drawPrompt()
+                elseif p1 == keys.backspace then
+                    cmdInput = cmdInput:sub(1, -2)
+                    drawPrompt()
+                end
             elseif event == "timer" and p1 == timer then
                 break
             end
+        end
+
+        -- Landing: lower target each tick, cut thrust when sensor is close
+        if landing then
+            local dist = sensor and sensor.getDistance() or nil
+            if dist and dist <= LAND_DIST then
+                allOff()
+                status("Landed!", 2)
+                return
+            end
+            targetAlt = targetAlt - DESCENT_RATE
         end
 
         local angles                       = gimbal.getAngles()
@@ -275,6 +372,7 @@ local function stabilize()
 
         drawStat(pitch, roll, pitchRate, rollRate, alt, altErr, altRate, altCorr,
             dFL, dFR, dBL, dBR)
+        drawPrompt()
     end
 end
 
@@ -303,6 +401,12 @@ local function showHelp()
         "  start            - start stabilizer",
         "  ptrim <num>      - pitch trim (+fwd/-back)",
         "  rtrim <num>      - roll trim (+right/-left)",
+        "",
+        "In-flight only (type while stabilizing):",
+        "  stop             - kill thrust and exit",
+        "  land             - auto-land via optical sensor",
+        "  target <Y>       - change target altitude live",
+        "  (all gain/trim/power commands work too)",
         "",
         "Scroll or press any key to return.",
     }
@@ -585,16 +689,6 @@ end
 -- ============================================================
 -- Main loop
 -- ============================================================
-local cmdInput = ""
-
-local function drawPrompt()
-    term.redirect(cmdWin)
-    term.clear()
-    term.setCursorPos(1, 1)
-    term.write(">" .. cmdInput)
-    term.redirect(term.native())
-end
-
 local function fullDraw()
     drawMain()
     drawPrompt()
