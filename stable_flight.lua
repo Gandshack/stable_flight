@@ -26,6 +26,8 @@ local config      = {
     altKD      = 2.0,
     altMax     = 4,
     targetAlt  = nil, -- nil = use current altitude on start
+    pitchTrim  = 0,
+    rollTrim   = 0,
 }
 
 local function saveConfig()
@@ -46,6 +48,8 @@ local function loadConfig()
     if config.altKP == nil then config.altKP = 0.5 end
     if config.altKD == nil then config.altKD = 2.0 end
     if config.altMax == nil then config.altMax = 4 end
+    if config.pitchTrim == nil then config.pitchTrim = 0 end
+    if config.rollTrim == nil then config.rollTrim = 0 end
 end
 
 loadConfig()
@@ -120,39 +124,39 @@ local function allOff()
     end
 end
 
+local mainScroll = 0
+
+local function buildMainLines()
+    local lines = { "=== Stable Flight ===", "", "Thruster relays:" }
+    for _, pos in ipairs(POSITIONS) do
+        table.insert(lines, string.format("  %-12s = %s", pos, config.relays[pos] or "<unset>"))
+    end
+    table.insert(lines, "")
+    table.insert(lines, string.format("Hover power : %.2f", config.hoverPower))
+    table.insert(lines, string.format("Tilt P/D    : %.2f / %.2f", config.kP, config.kD))
+    table.insert(lines, string.format("Alt  P/D    : %.2f / %.2f", config.altKP, config.altKD))
+    table.insert(lines, string.format("Alt max     : %d", config.altMax))
+    table.insert(lines, string.format("Target alt  : %s",
+        config.targetAlt and string.format("%.2f", config.targetAlt) or "<auto>"))
+    table.insert(lines, string.format("Output side : %s", config.side))
+    table.insert(lines, string.format("Trim P/R    : %+.2f / %+.2f", config.pitchTrim, config.rollTrim))
+    table.insert(lines, "")
+    table.insert(lines, "Type 'help' for commands.")
+    return lines
+end
+
 local function drawMain()
+    local lines  = buildMainLines()
+    local maxOff = math.max(0, #lines - (h - 1))
+    if mainScroll > maxOff then mainScroll = maxOff end
+
     term.redirect(mainWin)
     term.clear()
-    term.setCursorPos(1, 1)
-    term.write("=== Stable Flight ===")
-
-    term.setCursorPos(1, 3)
-    term.write("Thruster relays:")
-    for i, pos in ipairs(POSITIONS) do
-        term.setCursorPos(1, 3 + i)
-        term.write(string.format("  %-12s = %s", pos, config.relays[pos] or "<unset>"))
+    for y = 1, h - 1 do
+        local line = lines[y + mainScroll]
+        term.setCursorPos(1, y)
+        if line then term.write(line) end
     end
-
-    term.setCursorPos(1, 9)
-    term.write(string.format("Hover power : %.2f", config.hoverPower))
-    term.setCursorPos(1, 10)
-    term.write(string.format("Tilt P/D    : %.2f / %.2f", config.kP, config.kD))
-    term.setCursorPos(1, 11)
-    term.write(string.format("Alt  P/D    : %.2f / %.2f", config.altKP, config.altKD))
-    term.setCursorPos(1, 12)
-    term.write(string.format("Alt max     : %d", config.altMax))
-    term.setCursorPos(1, 13)
-    if config.targetAlt then
-        term.write(string.format("Target alt  : %.2f", config.targetAlt))
-    else
-        term.write("Target alt  : <auto>")
-    end
-    term.setCursorPos(1, 14)
-    term.write(string.format("Output side : %s", config.side))
-
-    term.setCursorPos(1, 16)
-    term.write("Type 'help' for commands.")
-
     term.redirect(term.native())
 end
 
@@ -250,8 +254,8 @@ local function stabilize()
         lastRoll      = roll
         lastAlt       = alt
 
-        local pc      = (pitch * config.kP) + (pitchRate * config.kD)
-        local rc      = (roll * config.kP) + (rollRate * config.kD)
+        local pc      = ((pitch - config.pitchTrim) * config.kP) + (pitchRate * config.kD)
+        local rc      = ((roll - config.rollTrim) * config.kP) + (rollRate * config.kD)
 
         local altErr  = targetAlt - alt
         local altCorr = clamp(
@@ -297,17 +301,40 @@ local function showHelp()
         "  target auto      - capture altitude on start",
         "  side <side>      - set output side",
         "  start            - start stabilizer",
+        "  ptrim <num>      - pitch trim (+fwd/-back)",
+        "  rtrim <num>      - roll trim (+right/-left)",
         "",
-        "Press any key to return...",
+        "Scroll or press any key to return.",
     }
-    term.redirect(mainWin)
-    term.clear()
-    for i, line in ipairs(lines) do
-        term.setCursorPos(1, i)
-        term.write(line)
+
+    local offset = 0
+    local maxOff = math.max(0, #lines - (h - 1))
+
+    local function draw()
+        term.redirect(mainWin)
+        term.clear()
+        for y = 1, h - 1 do
+            local line = lines[y + offset]
+            term.setCursorPos(1, y)
+            if line then term.write(line) end
+        end
+        term.redirect(cmdWin)
+        term.clear()
+        term.setCursorPos(1, 1)
+        term.write("Scroll or press any key...")
+        term.redirect(term.native())
     end
-    term.redirect(term.native())
-    os.pullEvent("key")
+
+    draw()
+    while true do
+        local event, p1 = os.pullEvent()
+        if event == "mouse_scroll" then
+            offset = math.max(0, math.min(offset + p1, maxOff))
+            draw()
+        elseif event == "key" then
+            return
+        end
+    end
 end
 
 local function showRelays()
@@ -526,6 +553,22 @@ local function handleCommand(cmd)
                 status("Usage: target <Y> | target auto", 2)
             end
         end
+    elseif cmd:match("^ptrim ") then
+        local n = tonumber(cmd:match("^ptrim (%S+)$"))
+        if n then
+            config.pitchTrim = n; saveConfig()
+            status("Pitch trim: " .. string.format("%+.2f", n), 1)
+        else
+            status("Usage: ptrim <number>", 2)
+        end
+    elseif cmd:match("^rtrim ") then
+        local n = tonumber(cmd:match("^rtrim (%S+)$"))
+        if n then
+            config.rollTrim = n; saveConfig()
+            status("Roll trim: " .. string.format("%+.2f", n), 1)
+        else
+            status("Usage: rtrim <number>", 2)
+        end
     elseif cmd:match("^side ") then
         local s = cmd:match("^side (%S+)$")
         if s then
@@ -562,7 +605,12 @@ fullDraw()
 while true do
     local event, p1 = os.pullEvent()
 
-    if event == "char" then
+    if event == "mouse_scroll" then
+        local lines  = buildMainLines()
+        local maxOff = math.max(0, #lines - (h - 1))
+        mainScroll   = math.max(0, math.min(mainScroll + p1, maxOff))
+        drawMain()
+    elseif event == "char" then
         cmdInput = cmdInput .. p1
         drawPrompt()
     elseif event == "key" then
