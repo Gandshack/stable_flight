@@ -1,21 +1,26 @@
 -- stable_flight.lua
--- Flight stabilizer with scrollable output
+-- Flight stabilizer
 
 local CONFIG_FILE = "stable_flight.cfg"
+local POSITIONS   = { "front_left", "front_right", "back_left", "back_right" }
+
+local w, h        = term.getSize()
+local mainWin     = window.create(term.current(), 1, 1, w, h - 1)
+local cmdWin      = window.create(term.current(), 1, h, w, 1)
 
 -- ============================================================
 -- Config persistence
 -- ============================================================
-local config = {
+local config      = {
     relays     = {
         front_left  = nil,
         front_right = nil,
         back_left   = nil,
         back_right  = nil,
     },
-    side       = "top", -- which side of relay outputs to thruster
-    hoverPower = 8,     -- baseline 0-15
-    kP         = 0.3,   -- proportional gain
+    side       = "top",
+    hoverPower = 8,
+    kP         = 0.3,
 }
 
 local function saveConfig()
@@ -37,53 +42,22 @@ end
 loadConfig()
 
 -- ============================================================
--- Scrollable output
+-- Helpers
 -- ============================================================
-local w, h    = term.getSize()
-local mainWin = window.create(term.current(), 1, 1, w, h - 1)
-local cmdWin  = window.create(term.current(), 1, h, w, 1)
-
-local history = {}
-local scroll  = 0
-
-local function maxScroll()
-    return math.max(0, #history - (h - 1))
+local function clamp(n, lo, hi)
+    if n < lo then return lo end
+    if n > hi then return hi end
+    return n
 end
 
-local function redraw()
-    local prev = term.redirect(mainWin)
+local function status(msg, duration)
+    term.redirect(cmdWin)
     term.clear()
-    local viewH    = h - 1
-    local startIdx = math.max(1, #history - viewH + 1 - scroll)
-    local endIdx   = math.min(#history, startIdx + viewH - 1)
-    local row      = 1
-    for i = startIdx, endIdx do
-        term.setCursorPos(1, row)
-        term.write(history[i])
-        row = row + 1
-    end
-    term.redirect(prev)
+    term.setCursorPos(1, 1)
+    term.write(msg)
+    term.redirect(term.native())
+    sleep(duration or 1)
 end
-
-local function say(...)
-    local args = { ... }
-    local parts = {}
-    for i = 1, select("#", ...) do parts[i] = tostring(args[i]) end
-    local line = table.concat(parts, "\t")
-    -- split on newlines so multi-line strings still scroll right
-    if line == "" then
-        table.insert(history, "")
-    else
-        for piece in (line .. "\n"):gmatch("(.-)\n") do
-            table.insert(history, piece)
-        end
-    end
-    scroll = 0
-    redraw()
-end
-
--- All print() calls in the rest of the program go through say()
-print = say
 
 -- ============================================================
 -- Peripheral discovery
@@ -99,19 +73,17 @@ local function listRelays()
             table.insert(names, name)
         end
     end
-    table.sort(names)
+    table.sort(names, function(a, b)
+        local na = tonumber(a:match("(%d+)$")) or 0
+        local nb = tonumber(b:match("(%d+)$")) or 0
+        return na < nb
+    end)
     return names
 end
 
 -- ============================================================
 -- Stabilizer
 -- ============================================================
-local function clamp(n, lo, hi)
-    if n < lo then return lo end
-    if n > hi then return hi end
-    return n
-end
-
 local function setThrust(relayName, power)
     if not relayName then return end
     local relay = peripheral.wrap(relayName)
@@ -128,228 +100,373 @@ local function allOff()
     end
 end
 
+-- Main view: shows live config / status. Re-rendered any time it could change.
+local function drawMain(extra)
+    term.redirect(mainWin)
+    term.clear()
+    term.setCursorPos(1, 1)
+    term.write("=== Stable Flight ===")
+
+    term.setCursorPos(1, 3)
+    term.write("Thruster relays:")
+    for i, pos in ipairs(POSITIONS) do
+        term.setCursorPos(1, 3 + i)
+        term.write(string.format("  %-12s = %s", pos, config.relays[pos] or "<unset>"))
+    end
+
+    term.setCursorPos(1, 9)
+    term.write(string.format("Hover power : %d", config.hoverPower))
+    term.setCursorPos(1, 10)
+    term.write(string.format("Gain (kP)   : %.2f", config.kP))
+    term.setCursorPos(1, 11)
+    term.write(string.format("Output side : %s", config.side))
+
+    term.setCursorPos(1, 13)
+    term.write("Type 'help' for commands.")
+
+    if extra then
+        term.setCursorPos(1, 15)
+        term.write(extra)
+    end
+
+    term.redirect(term.native())
+end
+
+-- ============================================================
+-- Scrollable views (chest-browser pattern)
+-- ============================================================
+local function showHelp()
+    local lines = {
+        "Commands:",
+        "  q, quit          - exit program",
+        "  help             - show this help",
+        "  list             - list available relays",
+        "  show             - show current config",
+        "  perf             - list all peripherals",
+        "  set <pos> <num>  - assign relay to position",
+        "                     pos: front_left, front_right,",
+        "                          back_left, back_right",
+        "  pulse <pos>      - test a position",
+        "  power <0-15>     - set hover power",
+        "  gain <number>    - set proportional gain",
+        "  side <up|down|.> - set output redstone side",
+        "  start            - start stabilizer",
+        "",
+        "Press any key to return...",
+    }
+    term.redirect(mainWin)
+    term.clear()
+    for i, line in ipairs(lines) do
+        term.setCursorPos(1, i)
+        term.write(line)
+    end
+    term.redirect(term.native())
+    os.pullEvent("key")
+end
+
+local function showRelays()
+    local relays = listRelays()
+    if #relays == 0 then
+        status("No relays found on the network.", 2)
+        return
+    end
+
+    local offset = 0
+    local maxOff = math.max(0, #relays - (h - 2))
+
+    -- Find which relays are currently assigned (for marking)
+    local assigned = {}
+    for pos, name in pairs(config.relays) do
+        if name then assigned[name] = pos end
+    end
+
+    local function draw()
+        term.redirect(mainWin)
+        term.clear()
+        term.setCursorPos(1, 1)
+        term.write(string.format("Relays (%d)  (* = assigned)", #relays))
+        for y = 2, h - 1 do
+            local idx = y - 1 + offset
+            local name = relays[idx]
+            term.setCursorPos(1, y)
+            if name then
+                local marker = assigned[name] and "*" or " "
+                local label = assigned[name] and (" -> " .. assigned[name]) or ""
+                term.write(string.format("%s%2d. %s%s", marker, idx, name, label))
+            end
+        end
+        term.redirect(cmdWin)
+        term.clear()
+        term.setCursorPos(1, 1)
+        term.write("Scroll or press any key...")
+        term.redirect(term.native())
+    end
+
+    draw()
+    while true do
+        local event, p1 = os.pullEvent()
+        if event == "mouse_scroll" then
+            offset = math.max(0, math.min(offset + p1, maxOff))
+            draw()
+        elseif event == "key" then
+            return
+        end
+    end
+end
+
+local function listPeripherals()
+    local all = {}
+    for _, name in ipairs(peripheral.getNames()) do
+        table.insert(all, { name = name, ptype = peripheral.getType(name) })
+    end
+    table.sort(all, function(a, b) return a.name < b.name end)
+
+    if #all == 0 then
+        status("No peripherals found!", 2)
+        return
+    end
+
+    local offset = 0
+    local maxOff = math.max(0, #all - (h - 2))
+
+    local function draw()
+        term.redirect(mainWin)
+        term.clear()
+        term.setCursorPos(1, 1)
+        term.write(string.format("All peripherals (%d)", #all))
+        for y = 2, h - 1 do
+            local idx = y - 1 + offset
+            local entry = all[idx]
+            term.setCursorPos(1, y)
+            if entry then
+                term.write(string.format("  %s [%s]", entry.name, entry.ptype or "?"))
+            end
+        end
+        term.redirect(cmdWin)
+        term.clear()
+        term.setCursorPos(1, 1)
+        term.write("Scroll or press any key...")
+        term.redirect(term.native())
+    end
+
+    draw()
+    while true do
+        local event, p1 = os.pullEvent()
+        if event == "mouse_scroll" then
+            offset = math.max(0, math.min(offset + p1, maxOff))
+            draw()
+        elseif event == "key" then
+            return
+        end
+    end
+end
+
+-- ============================================================
+-- Stabilizer (its own view)
+-- ============================================================
 local function stabilize()
     local gimbal = findGimbal()
     if not gimbal then
-        print("No gimbal sensor found!")
+        status("No gimbal sensor found!", 2)
         return
     end
 
     for pos, name in pairs(config.relays) do
         if not name then
-            print("Relay '" .. pos .. "' not set. Use: set " .. pos .. " <number>")
+            status("'" .. pos .. "' not set!", 2)
             return
         end
     end
 
-    print("Stabilizing. Press any key to stop.")
+    local function drawStat(pitch, roll, fl, fr, bl, br)
+        term.redirect(mainWin)
+        term.clear()
+        term.setCursorPos(1, 1)
+        term.write("=== STABILIZING ===")
+        term.setCursorPos(1, 3)
+        term.write(string.format("Pitch (X): %7.2f", pitch))
+        term.setCursorPos(1, 4)
+        term.write(string.format("Roll  (Z): %7.2f", roll))
+        term.setCursorPos(1, 6)
+        term.write("Thrust output (0-15):")
+        term.setCursorPos(1, 7)
+        term.write(string.format("  FL: %2d   FR: %2d", fl, fr))
+        term.setCursorPos(1, 8)
+        term.write(string.format("  BL: %2d   BR: %2d", bl, br))
+        term.redirect(cmdWin)
+        term.clear()
+        term.setCursorPos(1, 1)
+        term.write("Press any key to stop")
+        term.redirect(term.native())
+    end
 
     while true do
         local timer = os.startTimer(0.05)
-        local event, p1 = os.pullEvent()
-        if event == "key" then
-            allOff()
-            print("Stopped.")
-            return
+        while true do
+            local event, p1 = os.pullEvent()
+            if event == "key" then
+                allOff()
+                status("Stopped.", 1)
+                return
+            elseif event == "timer" and p1 == timer then
+                break
+            end
         end
 
-        if event == "timer" and p1 == timer then
-            local angles          = gimbal.getAngles()
-            local pitch           = angles[1]
-            local roll            = angles[2]
+        local angles = gimbal.getAngles()
+        local pitch  = angles[1]
+        local roll   = angles[2]
 
-            local pitchCorrection = pitch * config.kP
-            local rollCorrection  = roll * config.kP
+        local pc     = pitch * config.kP
+        local rc     = roll * config.kP
 
-            setThrust(config.relays.front_left, config.hoverPower - pitchCorrection - rollCorrection)
-            setThrust(config.relays.front_right, config.hoverPower - pitchCorrection + rollCorrection)
-            setThrust(config.relays.back_left, config.hoverPower + pitchCorrection - rollCorrection)
-            setThrust(config.relays.back_right, config.hoverPower + pitchCorrection + rollCorrection)
-        end
+        local fl     = clamp(math.floor(config.hoverPower - pc - rc + 0.5), 0, 15)
+        local fr     = clamp(math.floor(config.hoverPower - pc + rc + 0.5), 0, 15)
+        local bl     = clamp(math.floor(config.hoverPower + pc - rc + 0.5), 0, 15)
+        local br     = clamp(math.floor(config.hoverPower + pc + rc + 0.5), 0, 15)
+
+        setThrust(config.relays.front_left, fl)
+        setThrust(config.relays.front_right, fr)
+        setThrust(config.relays.back_left, bl)
+        setThrust(config.relays.back_right, br)
+
+        drawStat(pitch, roll, fl, fr, bl, br)
     end
 end
 
 -- ============================================================
 -- Commands
 -- ============================================================
-local POSITIONS = { "front_left", "front_right", "back_left", "back_right" }
-
-local function showRelays()
-    local relays = listRelays()
-    if #relays == 0 then
-        print("No relays found on the network.")
-        return
-    end
-    print("Available relays:")
-    for i, name in ipairs(relays) do
-        print(string.format("  %d. %s", i, name))
-    end
-end
-
-local function showConfig()
-    print("Current assignments:")
-    for _, pos in ipairs(POSITIONS) do
-        print(string.format("  %-12s = %s", pos, config.relays[pos] or "<unset>"))
-    end
-    print(string.format("  hoverPower   = %d", config.hoverPower))
-    print(string.format("  kP           = %.2f", config.kP))
-    print(string.format("  output side  = %s", config.side))
-end
-
 local function setRelay(pos, num)
     local relays = listRelays()
     local relay = relays[num]
     if not relay then
-        print("No relay #" .. tostring(num))
+        status("No relay #" .. tostring(num), 2)
         return
     end
     config.relays[pos] = relay
     saveConfig()
-    print("Set " .. pos .. " = " .. relay)
+    status("Set " .. pos .. " = " .. relay, 1)
 end
 
 local function pulse(pos)
     local name = config.relays[pos]
     if not name then
-        print("Not set: " .. pos); return
+        status("Not set: " .. pos, 2); return
     end
     local r = peripheral.wrap(name)
     if not r then
-        print("Can't wrap " .. name); return
+        status("Can't wrap " .. name, 2); return
     end
-    print("Pulsing " .. pos .. " (" .. name .. ")")
     r.setAnalogOutput(config.side, 15)
+    status("Pulsing " .. pos .. "...", 0)
     sleep(2)
     r.setAnalogOutput(config.side, 0)
+    status("Done.", 1)
 end
 
-local function showHelp()
-    print("Commands:")
-    print("  list                   - list available relays")
-    print("  show                   - show current config")
-    print("  set <pos> <num>        - assign a relay number to a position")
-    print("                           pos = front_left, front_right,")
-    print("                                 back_left, back_right")
-    print("  pulse <pos>            - test a position by pulsing it")
-    print("  power <0-15>           - set hover power")
-    print("  gain <number>          - set proportional gain (kP)")
-    print("  side <up|down|...>     - set output side")
-    print("  start                  - start stabilizer")
-    print("  quit                   - exit")
-    print("")
-    print("Mouse wheel / arrows / PgUp / PgDn = scroll output")
-end
-
-local function handleCommand(line)
-    local cmd, a, b = line:match("^(%S+)%s*(%S*)%s*(%S*)$")
-
-    if cmd == "quit" or cmd == "q" then
+local function handleCommand(cmd)
+    if cmd == "q" or cmd == "quit" then
+        term.clear()
+        term.setCursorPos(1, 1)
         return false
     elseif cmd == "help" then
         showHelp()
     elseif cmd == "list" then
         showRelays()
     elseif cmd == "show" then
-        showConfig()
-    elseif cmd == "set" then
+        -- main view already shows config; just refresh
+        status("Config shown above.", 1)
+    elseif cmd == "perf" then
+        listPeripherals()
+    elseif cmd == "start" then
+        stabilize()
+    elseif cmd == "push" then
+        -- nothing here; placeholder for parity with chesty
+    elseif cmd:match("^set ") then
+        local a, b = cmd:match("^set (%S+) (%S+)$")
         local num = tonumber(b)
-        if not config.relays[a] then
-            print("Unknown position. Use: " .. table.concat(POSITIONS, ", "))
+        if not a or not config.relays[a] then
+            status("Unknown pos. front_left/right, back_left/right", 2)
         elseif not num then
-            print("Need a relay number. Run 'list' to see them.")
+            status("Need a number. Use 'list'.", 2)
         else
             setRelay(a, num)
         end
-    elseif cmd == "pulse" then
-        if not config.relays[a] then
-            print("Unknown position.")
+    elseif cmd:match("^pulse ") then
+        local a = cmd:match("^pulse (%S+)$")
+        if not a or not config.relays[a] then
+            status("Unknown pos.", 2)
         else
             pulse(a)
         end
-    elseif cmd == "power" then
-        local n = tonumber(a)
+    elseif cmd:match("^power ") then
+        local n = tonumber(cmd:match("^power (%S+)$"))
         if n then
-            config.hoverPower = clamp(n, 0, 15); saveConfig(); print("Hover power: " .. config.hoverPower)
+            config.hoverPower = clamp(math.floor(n), 0, 15)
+            saveConfig()
+            status("Hover power: " .. config.hoverPower, 1)
         else
-            print("Need a number 0-15")
+            status("Usage: power 0-15", 2)
         end
-    elseif cmd == "gain" then
-        local n = tonumber(a)
+    elseif cmd:match("^gain ") then
+        local n = tonumber(cmd:match("^gain (%S+)$"))
         if n then
-            config.kP = n; saveConfig(); print("kP: " .. config.kP)
+            config.kP = n
+            saveConfig()
+            status("kP: " .. config.kP, 1)
         else
-            print("Need a number")
+            status("Usage: gain <number>", 2)
         end
-    elseif cmd == "side" then
-        if a ~= "" then
-            config.side = a; saveConfig(); print("Side: " .. a)
+    elseif cmd:match("^side ") then
+        local s = cmd:match("^side (%S+)$")
+        if s then
+            config.side = s
+            saveConfig()
+            status("Side: " .. s, 1)
         else
-            print("Need a side")
+            status("Usage: side <up|down|north|south|east|west>", 2)
         end
-    elseif cmd == "start" then
-        stabilize()
-    elseif cmd ~= "" and cmd ~= nil then
-        print("Unknown command. Type 'help'.")
+    elseif cmd ~= "" then
+        status("Unknown command. Type 'help'.", 1)
     end
     return true
 end
 
 -- ============================================================
--- Main loop
+-- Main loop (chest-browser style)
 -- ============================================================
-showHelp()
-print("")
-showConfig()
-
 local cmdInput = ""
 
 local function drawPrompt()
-    local prev = term.redirect(cmdWin)
+    term.redirect(cmdWin)
     term.clear()
     term.setCursorPos(1, 1)
-    term.write("> " .. cmdInput)
-    term.setCursorBlink(true)
-    term.redirect(prev)
+    term.write(">" .. cmdInput)
+    term.redirect(term.native())
 end
 
-drawPrompt()
+local function fullDraw()
+    drawMain()
+    drawPrompt()
+end
+
+fullDraw()
 
 while true do
     local event, p1 = os.pullEvent()
 
-    if event == "mouse_scroll" then
-        scroll = math.max(0, math.min(scroll - p1, maxScroll()))
-        redraw()
-    elseif event == "char" then
+    if event == "char" then
         cmdInput = cmdInput .. p1
         drawPrompt()
     elseif event == "key" then
         if p1 == keys.enter then
-            local line = cmdInput
+            if not handleCommand(cmdInput) then break end
             cmdInput = ""
-            say("> " .. line)
-            if not handleCommand(line) then
-                term.redirect(term.native())
-                term.clear()
-                term.setCursorPos(1, 1)
-                break
-            end
-            drawPrompt()
+            fullDraw()
         elseif p1 == keys.backspace then
             cmdInput = cmdInput:sub(1, -2)
             drawPrompt()
-        elseif p1 == keys.up then
-            scroll = math.min(scroll + 1, maxScroll())
-            redraw()
-        elseif p1 == keys.down then
-            scroll = math.max(scroll - 1, 0)
-            redraw()
-        elseif p1 == keys.pageUp then
-            scroll = math.min(scroll + (h - 1), maxScroll())
-            redraw()
-        elseif p1 == keys.pageDown then
-            scroll = math.max(scroll - (h - 1), 0)
-            redraw()
         end
     end
 end
