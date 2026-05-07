@@ -19,8 +19,8 @@ local config      = {
         back_right  = nil,
     },
     velSensors = {
-        x = nil, -- peripheral name for X-axis (sideways) velocity
-        z = nil, -- peripheral name for Z-axis (forward/back) velocity
+        x = nil,
+        z = nil,
     },
     side       = "top",
     hoverPower = 4.3,
@@ -30,10 +30,9 @@ local config      = {
     altKD      = 2.0,
     altMax     = 4,
     targetAlt  = nil,
-    -- Velocity outer loop
-    velKP      = 5.0,  -- velocity error -> target lean angle (degrees)
-    velKD      = 2.0,  -- velocity rate damping
-    maxLean    = 20,   -- max angle (deg) the velocity loop can command
+    velKP      = 5.0,
+    velKD      = 2.0,
+    maxLean    = 20,
     targetVelX = 0,
     targetVelZ = 0,
 }
@@ -50,7 +49,6 @@ local function loadConfig()
     local data = textutils.unserialize(f.readAll())
     f.close()
     if data then for k, v in pairs(data) do config[k] = v end end
-    -- Migrations for old configs
     if config.kD == nil then config.kD = 1.0 end
     if config.altKP == nil then config.altKP = 0.5 end
     if config.altKD == nil then config.altKD = 2.0 end
@@ -150,47 +148,61 @@ local function allOff()
     end
 end
 
+-- ============================================================
+-- Scrollable main view
+-- ============================================================
+local function buildMainLines()
+    local lines = {
+        "=== Stable Flight ===",
+        "",
+        "Thruster relays:",
+    }
+    for _, pos in ipairs(POSITIONS) do
+        table.insert(lines, string.format("  %-12s = %s", pos, config.relays[pos] or "<unset>"))
+    end
+    table.insert(lines, "")
+    table.insert(lines, "Velocity sensors:")
+    table.insert(lines, string.format("  %-3s = %s", "x", config.velSensors.x or "<unset>"))
+    table.insert(lines, string.format("  %-3s = %s", "z", config.velSensors.z or "<unset>"))
+    table.insert(lines, "")
+    table.insert(lines, string.format("Hover power : %.2f", config.hoverPower))
+    table.insert(lines, string.format("Tilt P/D    : %.2f / %.2f", config.kP, config.kD))
+    table.insert(lines, string.format("Alt  P/D    : %.2f / %.2f  max %d",
+        config.altKP, config.altKD, config.altMax))
+    table.insert(lines, string.format("Vel  P/D    : %.2f / %.2f  lean %d",
+        config.velKP, config.velKD, config.maxLean))
+    table.insert(lines, "")
+    table.insert(lines, string.format("Target alt : %s",
+        config.targetAlt and string.format("%.2f", config.targetAlt) or "<auto>"))
+    table.insert(lines, string.format("Target vel : x=%.2f  z=%.2f",
+        config.targetVelX, config.targetVelZ))
+    table.insert(lines, string.format("Output side: %s", config.side))
+    table.insert(lines, "")
+    table.insert(lines, "Type 'help' for commands.")
+    return lines
+end
+
+local mainScroll = 0
+
 local function drawMain()
+    local lines = buildMainLines()
+    local maxOff = math.max(0, #lines - (h - 1))
+    if mainScroll > maxOff then mainScroll = maxOff end
+
     term.redirect(mainWin)
     term.clear()
-    term.setCursorPos(1, 1)
-    term.write("=== Stable Flight ===")
-
-    term.setCursorPos(1, 3)
-    term.write("Thruster relays:")
-    for i, pos in ipairs(POSITIONS) do
-        term.setCursorPos(1, 3 + i)
-        term.write(string.format("  %-12s = %s", pos, config.relays[pos] or "<unset>"))
+    for y = 1, h - 1 do
+        local idx = y + mainScroll
+        local line = lines[idx]
+        term.setCursorPos(1, y)
+        if line then term.write(line) end
     end
-
-    term.setCursorPos(1, 8)
-    term.write("Velocity sensors:")
-    term.setCursorPos(1, 9)
-    term.write(string.format("  %-3s = %s", "x", config.velSensors.x or "<unset>"))
-    term.setCursorPos(1, 10)
-    term.write(string.format("  %-3s = %s", "z", config.velSensors.z or "<unset>"))
-
-    term.setCursorPos(1, 12)
-    term.write(string.format("Hover power : %.2f", config.hoverPower))
-    term.setCursorPos(1, 13)
-    term.write(string.format("Tilt P/D    : %.2f / %.2f", config.kP, config.kD))
-    term.setCursorPos(1, 14)
-    term.write(string.format("Alt  P/D    : %.2f / %.2f  max %d",
-        config.altKP, config.altKD, config.altMax))
-    term.setCursorPos(1, 15)
-    term.write(string.format("Vel  P/D    : %.2f / %.2f  lean %d",
-        config.velKP, config.velKD, config.maxLean))
-
-    term.setCursorPos(1, 17)
-    term.write(string.format("Target alt : %s",
-        config.targetAlt and string.format("%.2f", config.targetAlt) or "<auto>"))
-    term.setCursorPos(1, 18)
-    term.write(string.format("Target vel : x=%.2f  z=%.2f",
-        config.targetVelX, config.targetVelZ))
-
     term.redirect(term.native())
 end
 
+-- ============================================================
+-- Stabilizer
+-- ============================================================
 local function stabilize()
     local gimbal = findGimbal()
     if not gimbal then
@@ -274,7 +286,6 @@ local function stabilize()
             end
         end
 
-        -- Read sensors
         local angles                                       = gimbal.getAngles()
         local roll                                         = -angles[1]
         local pitch                                        = angles[2]
@@ -282,7 +293,6 @@ local function stabilize()
         local vx                                           = velX.getVelocity()
         local vz                                           = velZ.getVelocity()
 
-        -- Rates
         local pitchRate, rollRate, altRate, vxRate, vzRate = 0, 0, 0, 0, 0
         if not firstTick then
             pitchRate = pitch - lastPitch
@@ -295,11 +305,7 @@ local function stabilize()
         lastPitch      = pitch; lastRoll = roll; lastAlt = alt
         lastVX         = vx; lastVZ = vz
 
-        -- ===== OUTER LOOP: velocity -> target attitude =====
-        -- Velocity error -> desired lean angle
-        -- To accelerate +X, we need to roll a certain way; to accelerate +Z, pitch.
-        -- Sign convention guess: positive vel error -> positive lean.
-        -- If craft accelerates wrong way, flip sign of velKP/velKD or swap sensor axes.
+        -- Outer loop: velocity -> target attitude
         local vxErr    = config.targetVelX - vx
         local vzErr    = config.targetVelZ - vz
 
@@ -312,22 +318,21 @@ local function stabilize()
             -config.maxLean, config.maxLean
         )
 
-        -- ===== INNER LOOP: attitude -> thrust =====
-        -- Note: error = current - target (not target - current), so when at-target the correction is zero
+        -- Inner loop: attitude -> thrust
         local pitchErr = pitch - tgtPitch
         local rollErr  = roll - tgtRoll
 
         local pc       = (pitchErr * config.kP) + (pitchRate * config.kD)
         local rc       = (rollErr * config.kP) + (rollRate * config.kD)
 
-        -- ===== ALTITUDE LOOP =====
+        -- Altitude loop
         local altErr   = targetAlt - alt
         local altCorr  = clamp(
             (altErr * config.altKP) - (altRate * config.altKD),
             -config.altMax, config.altMax
         )
 
-        -- ===== MIX =====
+        -- Mix
         local fl       = clamp(config.hoverPower + altCorr - pc - rc, 0, 15)
         local fr       = clamp(config.hoverPower + altCorr - pc + rc, 0, 15)
         local bl       = clamp(config.hoverPower + altCorr + pc - rc, 0, 15)
@@ -343,47 +348,8 @@ local function stabilize()
 end
 
 -- ============================================================
--- Scrollable views
+-- Scrollable views (other commands)
 -- ============================================================
-local function showHelp()
-    local lines = {
-        "Commands:",
-        "  q, quit            - exit",
-        "  help               - this help",
-        "  list               - list relays",
-        "  vlist              - list velocity sensors",
-        "  perf               - list all peripherals",
-        "  set <pos> <num>    - assign relay",
-        "  setvel <axis> <n>  - assign vel sensor (axis=x|z)",
-        "  pulse <pos>        - test thruster",
-        "  power <num>        - hover power (decimals OK)",
-        "  gain <num>         - tilt P gain",
-        "  dgain <num>        - tilt D gain",
-        "  altgain <num>      - alt P gain",
-        "  altdgain <num>     - alt D gain",
-        "  altmax <num>       - max alt correction",
-        "  velgain <num>      - vel P gain",
-        "  veldgain <num>     - vel D gain",
-        "  maxlean <num>      - max lean angle (deg)",
-        "  target <Y>|auto    - target altitude",
-        "  velx <num>         - target X velocity",
-        "  velz <num>         - target Z velocity",
-        "  hover              - velx 0, velz 0",
-        "  side <side>        - relay output side",
-        "  start              - run stabilizer",
-        "",
-        "Press any key to return...",
-    }
-    term.redirect(mainWin)
-    term.clear()
-    for i, line in ipairs(lines) do
-        term.setCursorPos(1, i)
-        term.write(line)
-    end
-    term.redirect(term.native())
-    os.pullEvent("key")
-end
-
 local function showScrollList(title, items, render)
     if #items == 0 then
         status("Nothing to show.", 2); return
@@ -420,6 +386,38 @@ local function showScrollList(title, items, render)
             return
         end
     end
+end
+
+local function showHelp()
+    local lines = {
+        "Commands:",
+        "  q, quit            - exit",
+        "  help               - this help",
+        "  list               - list relays",
+        "  vlist              - list velocity sensors",
+        "  perf               - list all peripherals",
+        "  set <pos> <num>    - assign relay",
+        "  setvel <axis> <n>  - assign vel sensor (x|z)",
+        "  pulse <pos>        - test thruster",
+        "  power <num>        - hover power",
+        "  gain <num>         - tilt P gain",
+        "  dgain <num>        - tilt D gain",
+        "  altgain <num>      - alt P gain",
+        "  altdgain <num>     - alt D gain",
+        "  altmax <num>       - max alt correction",
+        "  velgain <num>      - vel P gain",
+        "  veldgain <num>     - vel D gain",
+        "  maxlean <num>      - max lean (deg)",
+        "  target <Y>|auto    - target altitude",
+        "  velx <num>         - target X velocity",
+        "  velz <num>         - target Z velocity",
+        "  hover              - velx 0, velz 0",
+        "  side <side>        - relay output side",
+        "  start              - run stabilizer",
+        "",
+        "Scroll/arrows on main view. Any key to return.",
+    }
+    showScrollList("Help", lines, function(line) return line end)
 end
 
 local function showRelays()
@@ -632,7 +630,12 @@ fullDraw()
 while true do
     local event, p1 = os.pullEvent()
 
-    if event == "char" then
+    if event == "mouse_scroll" then
+        local lines = buildMainLines()
+        local maxOff = math.max(0, #lines - (h - 1))
+        mainScroll = math.max(0, math.min(mainScroll + p1, maxOff))
+        drawMain()
+    elseif event == "char" then
         cmdInput = cmdInput .. p1
         drawPrompt()
     elseif event == "key" then
@@ -643,6 +646,14 @@ while true do
         elseif p1 == keys.backspace then
             cmdInput = cmdInput:sub(1, -2)
             drawPrompt()
+        elseif p1 == keys.up then
+            mainScroll = math.max(0, mainScroll - 1)
+            drawMain()
+        elseif p1 == keys.down then
+            local lines = buildMainLines()
+            local maxOff = math.max(0, #lines - (h - 1))
+            mainScroll = math.min(maxOff, mainScroll + 1)
+            drawMain()
         end
     end
 end
