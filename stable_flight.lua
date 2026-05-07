@@ -318,7 +318,7 @@ local function stabilize()
         local pitch  = angles[2] -- Z axis = forward/back tilt
 
         local pc     = pitch * config.kP
-        local rc     = roll * config.kP
+        local rc     = -roll * config.kP
 
         local fl     = clamp(math.floor(config.hoverPower - pc - rc + 0.5), 0, 15)
         local fr     = clamp(math.floor(config.hoverPower - pc + rc + 0.5), 0, 15)
