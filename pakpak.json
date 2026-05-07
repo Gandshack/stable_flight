@@ -1,0 +1,9 @@
+{
+  "name": "stable_flight",
+  "description": "flight stablizer program",
+  "version": "0.0.1",
+  "installPath": "/bin",
+  "files": [
+    "stable_flight.lua"
+  ]
+}
