@@ -284,9 +284,9 @@ local function stabilize()
         term.setCursorPos(1, 1)
         term.write("=== STABILIZING ===")
         term.setCursorPos(1, 3)
-        term.write(string.format("Pitch (X): %7.2f", pitch))
+        term.write(string.format("Pitch (Z): %7.2f", pitch))
         term.setCursorPos(1, 4)
-        term.write(string.format("Roll  (Z): %7.2f", roll))
+        term.write(string.format("Roll  (X): %7.2f", roll))
         term.setCursorPos(1, 6)
         term.write("Thrust output (0-15):")
         term.setCursorPos(1, 7)
@@ -314,8 +314,8 @@ local function stabilize()
         end
 
         local angles = gimbal.getAngles()
-        local pitch  = angles[1]
-        local roll   = angles[2]
+        local roll   = angles[1] -- X axis = left/right tilt
+        local pitch  = angles[2] -- Z axis = forward/back tilt
 
         local pc     = pitch * config.kP
         local rc     = roll * config.kP
