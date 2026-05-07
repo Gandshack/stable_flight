@@ -1,5 +1,5 @@
 -- stable_flight.lua
--- Flight stabilizer with PD control and dithered analog output
+-- Flight stabilizer with PD attitude + altitude hold
 
 local CONFIG_FILE = "stable_flight.cfg"
 local POSITIONS   = { "front_left", "front_right", "back_left", "back_right" }
@@ -22,6 +22,10 @@ local config      = {
     hoverPower = 4.3,
     kP         = 0.2,
     kD         = 1.0,
+    altKP      = 0.5,
+    altKD      = 2.0,
+    altMax     = 4,
+    targetAlt  = nil, -- nil = use current altitude on start
 }
 
 local function saveConfig()
@@ -39,6 +43,9 @@ local function loadConfig()
         for k, v in pairs(data) do config[k] = v end
     end
     if config.kD == nil then config.kD = 1.0 end
+    if config.altKP == nil then config.altKP = 0.5 end
+    if config.altKD == nil then config.altKD = 2.0 end
+    if config.altMax == nil then config.altMax = 4 end
 end
 
 loadConfig()
@@ -73,6 +80,10 @@ end
 -- ============================================================
 local function findGimbal()
     return peripheral.find("gimbal_sensor")
+end
+
+local function findAltimeter()
+    return peripheral.find("altitude_sensor")
 end
 
 local function listRelays()
@@ -125,13 +136,21 @@ local function drawMain()
     term.setCursorPos(1, 9)
     term.write(string.format("Hover power : %.2f", config.hoverPower))
     term.setCursorPos(1, 10)
-    term.write(string.format("Gain P (kP) : %.2f", config.kP))
+    term.write(string.format("Tilt P/D    : %.2f / %.2f", config.kP, config.kD))
     term.setCursorPos(1, 11)
-    term.write(string.format("Gain D (kD) : %.2f", config.kD))
+    term.write(string.format("Alt  P/D    : %.2f / %.2f", config.altKP, config.altKD))
     term.setCursorPos(1, 12)
+    term.write(string.format("Alt max     : %d", config.altMax))
+    term.setCursorPos(1, 13)
+    if config.targetAlt then
+        term.write(string.format("Target alt  : %.2f", config.targetAlt))
+    else
+        term.write("Target alt  : <auto>")
+    end
+    term.setCursorPos(1, 14)
     term.write(string.format("Output side : %s", config.side))
 
-    term.setCursorPos(1, 14)
+    term.setCursorPos(1, 16)
     term.write("Type 'help' for commands.")
 
     term.redirect(term.native())
@@ -144,6 +163,12 @@ local function stabilize()
         return
     end
 
+    local altimeter = findAltimeter()
+    if not altimeter then
+        status("No altitude sensor found!", 2)
+        return
+    end
+
     for pos, name in pairs(config.relays) do
         if not name then
             status("'" .. pos .. "' not set!", 2)
@@ -151,10 +176,13 @@ local function stabilize()
         end
     end
 
+    -- Use configured target or capture current altitude
+    local targetAlt = config.targetAlt or altimeter.getHeight()
+
     local lastPitch, lastRoll = 0, 0
+    local lastAlt = altimeter.getHeight()
     local firstTick = true
 
-    -- Dither accumulators (one per thruster)
     local accum = { fl = 0, fr = 0, bl = 0, br = 0 }
 
     local function dither(name, key, power)
@@ -166,27 +194,26 @@ local function stabilize()
         return whole
     end
 
-    local function drawStat(pitch, roll, pRate, rRate, fl, fr, bl, br, dFL, dFR, dBL, dBR)
+    local function drawStat(pitch, roll, pRate, rRate, alt, altErr, altRate, altCorr,
+                            dFL, dFR, dBL, dBR)
         term.redirect(mainWin)
         term.clear()
         term.setCursorPos(1, 1)
         term.write("=== STABILIZING ===")
         term.setCursorPos(1, 3)
-        term.write(string.format("Pitch (Z): %7.2f  rate %+6.2f", pitch, pRate))
+        term.write(string.format("Pitch: %7.2f rate %+5.2f", pitch, pRate))
         term.setCursorPos(1, 4)
-        term.write(string.format("Roll  (X): %7.2f  rate %+6.2f", roll, rRate))
+        term.write(string.format("Roll : %7.2f rate %+5.2f", roll, rRate))
         term.setCursorPos(1, 6)
-        term.write("Target thrust:")
+        term.write(string.format("Alt  : %7.2f tgt %7.2f", alt, targetAlt))
         term.setCursorPos(1, 7)
-        term.write(string.format("  FL: %5.2f  FR: %5.2f", fl, fr))
+        term.write(string.format("AErr : %+6.2f rate %+5.2f", altErr, altRate))
         term.setCursorPos(1, 8)
-        term.write(string.format("  BL: %5.2f  BR: %5.2f", bl, br))
+        term.write(string.format("AltCorr: %+5.2f", altCorr))
         term.setCursorPos(1, 10)
-        term.write("Sent (dithered):")
+        term.write("Sent (FL FR BL BR):")
         term.setCursorPos(1, 11)
-        term.write(string.format("  FL: %2d     FR: %2d", dFL, dFR))
-        term.setCursorPos(1, 12)
-        term.write(string.format("  BL: %2d     BR: %2d", dBL, dBR))
+        term.write(string.format("  %2d  %2d  %2d  %2d", dFL, dFR, dBL, dBR))
         term.redirect(cmdWin)
         term.clear()
         term.setCursorPos(1, 1)
@@ -207,35 +234,43 @@ local function stabilize()
             end
         end
 
-        local angles              = gimbal.getAngles()
-        local roll                = -angles[1] -- X axis, inverted
-        local pitch               = angles[2]  -- Z axis
+        local angles                       = gimbal.getAngles()
+        local roll                         = -angles[1]
+        local pitch                        = angles[2]
+        local alt                          = altimeter.getHeight()
 
-        local pitchRate, rollRate = 0, 0
+        local pitchRate, rollRate, altRate = 0, 0, 0
         if not firstTick then
             pitchRate = pitch - lastPitch
             rollRate  = roll - lastRoll
+            altRate   = alt - lastAlt
         end
-        firstTick = false
-        lastPitch = pitch
-        lastRoll  = roll
+        firstTick     = false
+        lastPitch     = pitch
+        lastRoll      = roll
+        lastAlt       = alt
 
-        local pc  = (pitch * config.kP) + (pitchRate * config.kD)
-        local rc  = (roll * config.kP) + (rollRate * config.kD)
+        local pc      = (pitch * config.kP) + (pitchRate * config.kD)
+        local rc      = (roll * config.kP) + (rollRate * config.kD)
 
-        -- Fractional target thrust (no rounding here!)
-        local fl  = clamp(config.hoverPower - pc - rc, 0, 15)
-        local fr  = clamp(config.hoverPower - pc + rc, 0, 15)
-        local bl  = clamp(config.hoverPower + pc - rc, 0, 15)
-        local br  = clamp(config.hoverPower + pc + rc, 0, 15)
+        local altErr  = targetAlt - alt
+        local altCorr = clamp(
+            (altErr * config.altKP) - (altRate * config.altKD),
+            -config.altMax, config.altMax
+        )
 
-        -- Dither to integer redstone levels
-        local dFL = dither(config.relays.front_left, "fl", fl)
-        local dFR = dither(config.relays.front_right, "fr", fr)
-        local dBL = dither(config.relays.back_left, "bl", bl)
-        local dBR = dither(config.relays.back_right, "br", br)
+        local fl      = clamp(config.hoverPower + altCorr - pc - rc, 0, 15)
+        local fr      = clamp(config.hoverPower + altCorr - pc + rc, 0, 15)
+        local bl      = clamp(config.hoverPower + altCorr + pc - rc, 0, 15)
+        local br      = clamp(config.hoverPower + altCorr + pc + rc, 0, 15)
 
-        drawStat(pitch, roll, pitchRate, rollRate, fl, fr, bl, br, dFL, dFR, dBL, dBR)
+        local dFL     = dither(config.relays.front_left, "fl", fl)
+        local dFR     = dither(config.relays.front_right, "fr", fr)
+        local dBL     = dither(config.relays.back_left, "bl", bl)
+        local dBR     = dither(config.relays.back_right, "br", br)
+
+        drawStat(pitch, roll, pitchRate, rollRate, alt, altErr, altRate, altCorr,
+            dFL, dFR, dBL, dBR)
     end
 end
 
@@ -251,13 +286,16 @@ local function showHelp()
         "  show             - show current config",
         "  perf             - list all peripherals",
         "  set <pos> <num>  - assign relay to position",
-        "                     pos: front_left, front_right,",
-        "                          back_left, back_right",
         "  pulse <pos>      - test a position",
-        "  power <0-15>     - set hover power (decimals OK)",
-        "  gain <number>    - set P gain (kP)",
-        "  dgain <number>   - set D gain (kD)",
-        "  side <up|down|.> - set output redstone side",
+        "  power <num>      - set hover power (decimals OK)",
+        "  gain <num>       - set tilt P gain",
+        "  dgain <num>      - set tilt D gain",
+        "  altgain <num>    - set altitude P gain",
+        "  altdgain <num>   - set altitude D gain",
+        "  altmax <num>     - max altitude correction",
+        "  target <Y>       - set target altitude",
+        "  target auto      - capture altitude on start",
+        "  side <side>      - set output side",
         "  start            - start stabilizer",
         "",
         "Press any key to return...",
@@ -401,9 +439,7 @@ end
 
 local function handleCommand(cmd)
     if cmd == "q" or cmd == "quit" then
-        term.clear()
-        term.setCursorPos(1, 1)
-        return false
+        term.clear(); term.setCursorPos(1, 1); return false
     elseif cmd == "help" then
         showHelp()
     elseif cmd == "list" then
@@ -434,8 +470,7 @@ local function handleCommand(cmd)
     elseif cmd:match("^power ") then
         local n = tonumber(cmd:match("^power (%S+)$"))
         if n then
-            config.hoverPower = clamp(n, 0, 15)
-            saveConfig()
+            config.hoverPower = clamp(n, 0, 15); saveConfig()
             status("Hover power: " .. string.format("%.2f", config.hoverPower), 1)
         else
             status("Usage: power 0-15", 2)
@@ -443,29 +478,60 @@ local function handleCommand(cmd)
     elseif cmd:match("^gain ") then
         local n = tonumber(cmd:match("^gain (%S+)$"))
         if n then
-            config.kP = n
-            saveConfig()
-            status("kP: " .. config.kP, 1)
+            config.kP = n; saveConfig(); status("kP: " .. n, 1)
         else
             status("Usage: gain <number>", 2)
         end
     elseif cmd:match("^dgain ") then
         local n = tonumber(cmd:match("^dgain (%S+)$"))
         if n then
-            config.kD = n
-            saveConfig()
-            status("kD: " .. config.kD, 1)
+            config.kD = n; saveConfig(); status("kD: " .. n, 1)
         else
             status("Usage: dgain <number>", 2)
+        end
+    elseif cmd:match("^altgain ") then
+        local n = tonumber(cmd:match("^altgain (%S+)$"))
+        if n then
+            config.altKP = n; saveConfig(); status("altKP: " .. n, 1)
+        else
+            status("Usage: altgain <number>", 2)
+        end
+    elseif cmd:match("^altdgain ") then
+        local n = tonumber(cmd:match("^altdgain (%S+)$"))
+        if n then
+            config.altKD = n; saveConfig(); status("altKD: " .. n, 1)
+        else
+            status("Usage: altdgain <number>", 2)
+        end
+    elseif cmd:match("^altmax ") then
+        local n = tonumber(cmd:match("^altmax (%S+)$"))
+        if n then
+            config.altMax = n; saveConfig(); status("altMax: " .. n, 1)
+        else
+            status("Usage: altmax <number>", 2)
+        end
+    elseif cmd:match("^target ") then
+        local arg = cmd:match("^target (%S+)$")
+        if arg == "auto" then
+            config.targetAlt = nil
+            saveConfig()
+            status("Target: auto (use current alt on start)", 1)
+        else
+            local n = tonumber(arg)
+            if n then
+                config.targetAlt = n
+                saveConfig()
+                status("Target altitude: " .. n, 1)
+            else
+                status("Usage: target <Y> | target auto", 2)
+            end
         end
     elseif cmd:match("^side ") then
         local s = cmd:match("^side (%S+)$")
         if s then
-            config.side = s
-            saveConfig()
-            status("Side: " .. s, 1)
+            config.side = s; saveConfig(); status("Side: " .. s, 1)
         else
-            status("Usage: side <up|down|north|south|east|west>", 2)
+            status("Usage: side <up|down|...>", 2)
         end
     elseif cmd ~= "" then
         status("Unknown command. Type 'help'.", 1)
