@@ -1,5 +1,5 @@
 -- stable_flight.lua
--- Flight stabilizer
+-- Flight stabilizer with scrollable output
 
 local CONFIG_FILE = "stable_flight.cfg"
 
@@ -35,6 +35,55 @@ local function loadConfig()
 end
 
 loadConfig()
+
+-- ============================================================
+-- Scrollable output
+-- ============================================================
+local w, h    = term.getSize()
+local mainWin = window.create(term.current(), 1, 1, w, h - 1)
+local cmdWin  = window.create(term.current(), 1, h, w, 1)
+
+local history = {}
+local scroll  = 0
+
+local function maxScroll()
+    return math.max(0, #history - (h - 1))
+end
+
+local function redraw()
+    local prev = term.redirect(mainWin)
+    term.clear()
+    local viewH    = h - 1
+    local startIdx = math.max(1, #history - viewH + 1 - scroll)
+    local endIdx   = math.min(#history, startIdx + viewH - 1)
+    local row      = 1
+    for i = startIdx, endIdx do
+        term.setCursorPos(1, row)
+        term.write(history[i])
+        row = row + 1
+    end
+    term.redirect(prev)
+end
+
+local function say(...)
+    local args = { ... }
+    local parts = {}
+    for i = 1, select("#", ...) do parts[i] = tostring(args[i]) end
+    local line = table.concat(parts, "\t")
+    -- split on newlines so multi-line strings still scroll right
+    if line == "" then
+        table.insert(history, "")
+    else
+        for piece in (line .. "\n"):gmatch("(.-)\n") do
+            table.insert(history, piece)
+        end
+    end
+    scroll = 0
+    redraw()
+end
+
+-- All print() calls in the rest of the program go through say()
+print = say
 
 -- ============================================================
 -- Peripheral discovery
@@ -86,7 +135,6 @@ local function stabilize()
         return
     end
 
-    -- Verify all 4 relays are configured
     for pos, name in pairs(config.relays) do
         if not name then
             print("Relay '" .. pos .. "' not set. Use: set " .. pos .. " <number>")
@@ -97,7 +145,6 @@ local function stabilize()
     print("Stabilizing. Press any key to stop.")
 
     while true do
-        -- check for key press without blocking
         local timer = os.startTimer(0.05)
         local event, p1 = os.pullEvent()
         if event == "key" then
@@ -106,19 +153,19 @@ local function stabilize()
             return
         end
 
-        local angles          = gimbal.getAngles()
-        local pitch           = angles[1] -- X-axis (forward/back tilt)
-        local roll            = angles[2] -- Z-axis (left/right tilt)
+        if event == "timer" and p1 == timer then
+            local angles          = gimbal.getAngles()
+            local pitch           = angles[1]
+            local roll            = angles[2]
 
-        local pitchCorrection = pitch * config.kP
-        local rollCorrection  = roll * config.kP
+            local pitchCorrection = pitch * config.kP
+            local rollCorrection  = roll * config.kP
 
-        -- If craft tips FORWARD (nose down), front needs LESS lift, back MORE.
-        -- Flip signs here if your contraption corrects backwards.
-        setThrust(config.relays.front_left, config.hoverPower - pitchCorrection - rollCorrection)
-        setThrust(config.relays.front_right, config.hoverPower - pitchCorrection + rollCorrection)
-        setThrust(config.relays.back_left, config.hoverPower + pitchCorrection - rollCorrection)
-        setThrust(config.relays.back_right, config.hoverPower + pitchCorrection + rollCorrection)
+            setThrust(config.relays.front_left, config.hoverPower - pitchCorrection - rollCorrection)
+            setThrust(config.relays.front_right, config.hoverPower - pitchCorrection + rollCorrection)
+            setThrust(config.relays.back_left, config.hoverPower + pitchCorrection - rollCorrection)
+            setThrust(config.relays.back_right, config.hoverPower + pitchCorrection + rollCorrection)
+        end
     end
 end
 
@@ -189,22 +236,15 @@ local function showHelp()
     print("  side <up|down|...>     - set output side")
     print("  start                  - start stabilizer")
     print("  quit                   - exit")
+    print("")
+    print("Mouse wheel / arrows / PgUp / PgDn = scroll output")
 end
 
--- ============================================================
--- Main loop
--- ============================================================
-showHelp()
-print()
-showConfig()
-
-while true do
-    write("> ")
-    local line = read()
+local function handleCommand(line)
     local cmd, a, b = line:match("^(%S+)%s*(%S*)%s*(%S*)$")
 
     if cmd == "quit" or cmd == "q" then
-        break
+        return false
     elseif cmd == "help" then
         showHelp()
     elseif cmd == "list" then
@@ -248,7 +288,68 @@ while true do
         end
     elseif cmd == "start" then
         stabilize()
-    elseif cmd ~= "" then
+    elseif cmd ~= "" and cmd ~= nil then
         print("Unknown command. Type 'help'.")
+    end
+    return true
+end
+
+-- ============================================================
+-- Main loop
+-- ============================================================
+showHelp()
+print("")
+showConfig()
+
+local cmdInput = ""
+
+local function drawPrompt()
+    local prev = term.redirect(cmdWin)
+    term.clear()
+    term.setCursorPos(1, 1)
+    term.write("> " .. cmdInput)
+    term.setCursorBlink(true)
+    term.redirect(prev)
+end
+
+drawPrompt()
+
+while true do
+    local event, p1 = os.pullEvent()
+
+    if event == "mouse_scroll" then
+        scroll = math.max(0, math.min(scroll - p1, maxScroll()))
+        redraw()
+    elseif event == "char" then
+        cmdInput = cmdInput .. p1
+        drawPrompt()
+    elseif event == "key" then
+        if p1 == keys.enter then
+            local line = cmdInput
+            cmdInput = ""
+            say("> " .. line)
+            if not handleCommand(line) then
+                term.redirect(term.native())
+                term.clear()
+                term.setCursorPos(1, 1)
+                break
+            end
+            drawPrompt()
+        elseif p1 == keys.backspace then
+            cmdInput = cmdInput:sub(1, -2)
+            drawPrompt()
+        elseif p1 == keys.up then
+            scroll = math.min(scroll + 1, maxScroll())
+            redraw()
+        elseif p1 == keys.down then
+            scroll = math.max(scroll - 1, 0)
+            redraw()
+        elseif p1 == keys.pageUp then
+            scroll = math.min(scroll + (h - 1), maxScroll())
+            redraw()
+        elseif p1 == keys.pageDown then
+            scroll = math.max(scroll - (h - 1), 0)
+            redraw()
+        end
     end
 end
