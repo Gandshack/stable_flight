@@ -1,5 +1,5 @@
 -- stable_flight.lua
--- Flight stabilizer with PD control
+-- Flight stabilizer with PD control and dithered analog output
 
 local CONFIG_FILE = "stable_flight.cfg"
 local POSITIONS   = { "front_left", "front_right", "back_left", "back_right" }
@@ -19,7 +19,7 @@ local config      = {
         back_right  = nil,
     },
     side       = "top",
-    hoverPower = 8,
+    hoverPower = 4.3,
     kP         = 0.2,
     kD         = 1.0,
 }
@@ -38,7 +38,6 @@ local function loadConfig()
     if data then
         for k, v in pairs(data) do config[k] = v end
     end
-    -- ensure new fields exist if loading old config
     if config.kD == nil then config.kD = 1.0 end
 end
 
@@ -94,11 +93,11 @@ end
 -- ============================================================
 -- Stabilizer
 -- ============================================================
-local function setThrust(relayName, power)
+local function setRawThrust(relayName, level)
     if not relayName then return end
     local relay = peripheral.wrap(relayName)
     if not relay then return end
-    relay.setAnalogOutput(config.side, clamp(math.floor(power + 0.5), 0, 15))
+    relay.setAnalogOutput(config.side, clamp(level, 0, 15))
 end
 
 local function allOff()
@@ -124,7 +123,7 @@ local function drawMain()
     end
 
     term.setCursorPos(1, 9)
-    term.write(string.format("Hover power : %d", config.hoverPower))
+    term.write(string.format("Hover power : %.2f", config.hoverPower))
     term.setCursorPos(1, 10)
     term.write(string.format("Gain P (kP) : %.2f", config.kP))
     term.setCursorPos(1, 11)
@@ -155,7 +154,19 @@ local function stabilize()
     local lastPitch, lastRoll = 0, 0
     local firstTick = true
 
-    local function drawStat(pitch, roll, pRate, rRate, fl, fr, bl, br)
+    -- Dither accumulators (one per thruster)
+    local accum = { fl = 0, fr = 0, bl = 0, br = 0 }
+
+    local function dither(name, key, power)
+        accum[key] = accum[key] + power
+        local whole = math.floor(accum[key] + 0.5)
+        accum[key] = accum[key] - whole
+        whole = clamp(whole, 0, 15)
+        setRawThrust(name, whole)
+        return whole
+    end
+
+    local function drawStat(pitch, roll, pRate, rRate, fl, fr, bl, br, dFL, dFR, dBL, dBR)
         term.redirect(mainWin)
         term.clear()
         term.setCursorPos(1, 1)
@@ -165,11 +176,17 @@ local function stabilize()
         term.setCursorPos(1, 4)
         term.write(string.format("Roll  (X): %7.2f  rate %+6.2f", roll, rRate))
         term.setCursorPos(1, 6)
-        term.write("Thrust output (0-15):")
+        term.write("Target thrust:")
         term.setCursorPos(1, 7)
-        term.write(string.format("  FL: %2d   FR: %2d", fl, fr))
+        term.write(string.format("  FL: %5.2f  FR: %5.2f", fl, fr))
         term.setCursorPos(1, 8)
-        term.write(string.format("  BL: %2d   BR: %2d", bl, br))
+        term.write(string.format("  BL: %5.2f  BR: %5.2f", bl, br))
+        term.setCursorPos(1, 10)
+        term.write("Sent (dithered):")
+        term.setCursorPos(1, 11)
+        term.write(string.format("  FL: %2d     FR: %2d", dFL, dFR))
+        term.setCursorPos(1, 12)
+        term.write(string.format("  BL: %2d     BR: %2d", dBL, dBR))
         term.redirect(cmdWin)
         term.clear()
         term.setCursorPos(1, 1)
@@ -192,7 +209,7 @@ local function stabilize()
 
         local angles              = gimbal.getAngles()
         local roll                = -angles[1] -- X axis, inverted
-        local pitch               = angles[2] -- Z axis
+        local pitch               = angles[2]  -- Z axis
 
         local pitchRate, rollRate = 0, 0
         if not firstTick then
@@ -206,17 +223,19 @@ local function stabilize()
         local pc  = (pitch * config.kP) + (pitchRate * config.kD)
         local rc  = (roll * config.kP) + (rollRate * config.kD)
 
-        local fl  = clamp(math.floor(config.hoverPower - pc - rc + 0.5), 0, 15)
-        local fr  = clamp(math.floor(config.hoverPower - pc + rc + 0.5), 0, 15)
-        local bl  = clamp(math.floor(config.hoverPower + pc - rc + 0.5), 0, 15)
-        local br  = clamp(math.floor(config.hoverPower + pc + rc + 0.5), 0, 15)
+        -- Fractional target thrust (no rounding here!)
+        local fl  = clamp(config.hoverPower - pc - rc, 0, 15)
+        local fr  = clamp(config.hoverPower - pc + rc, 0, 15)
+        local bl  = clamp(config.hoverPower + pc - rc, 0, 15)
+        local br  = clamp(config.hoverPower + pc + rc, 0, 15)
 
-        setThrust(config.relays.front_left, fl)
-        setThrust(config.relays.front_right, fr)
-        setThrust(config.relays.back_left, bl)
-        setThrust(config.relays.back_right, br)
+        -- Dither to integer redstone levels
+        local dFL = dither(config.relays.front_left, "fl", fl)
+        local dFR = dither(config.relays.front_right, "fr", fr)
+        local dBL = dither(config.relays.back_left, "bl", bl)
+        local dBR = dither(config.relays.back_right, "br", br)
 
-        drawStat(pitch, roll, pitchRate, rollRate, fl, fr, bl, br)
+        drawStat(pitch, roll, pitchRate, rollRate, fl, fr, bl, br, dFL, dFR, dBL, dBR)
     end
 end
 
@@ -235,7 +254,7 @@ local function showHelp()
         "                     pos: front_left, front_right,",
         "                          back_left, back_right",
         "  pulse <pos>      - test a position",
-        "  power <0-15>     - set hover power",
+        "  power <0-15>     - set hover power (decimals OK)",
         "  gain <number>    - set P gain (kP)",
         "  dgain <number>   - set D gain (kD)",
         "  side <up|down|.> - set output redstone side",
@@ -415,9 +434,9 @@ local function handleCommand(cmd)
     elseif cmd:match("^power ") then
         local n = tonumber(cmd:match("^power (%S+)$"))
         if n then
-            config.hoverPower = clamp(math.floor(n), 0, 15)
+            config.hoverPower = clamp(n, 0, 15)
             saveConfig()
-            status("Hover power: " .. config.hoverPower, 1)
+            status("Hover power: " .. string.format("%.2f", config.hoverPower), 1)
         else
             status("Usage: power 0-15", 2)
         end
