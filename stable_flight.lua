@@ -386,7 +386,9 @@ local function handleCommand(cmd)
     elseif cmd:match("^set ") then
         local a, b = cmd:match("^set (%S+) (%S+)$")
         local num = tonumber(b)
-        if not a or not config.relays[a] then
+        local validPos = {}
+        for _, p in ipairs(POSITIONS) do validPos[p] = true end
+        if not a or not validPos[a] then
             status("Unknown pos. front_left/right, back_left/right", 2)
         elseif not num then
             status("Need a number. Use 'list'.", 2)
