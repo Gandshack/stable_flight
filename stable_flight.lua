@@ -1,5 +1,5 @@
 -- stable_flight.lua
--- Flight stabilizer
+-- Flight stabilizer with PD control
 
 local CONFIG_FILE = "stable_flight.cfg"
 local POSITIONS   = { "front_left", "front_right", "back_left", "back_right" }
@@ -20,7 +20,8 @@ local config      = {
     },
     side       = "top",
     hoverPower = 8,
-    kP         = 0.3,
+    kP         = 0.2,
+    kD         = 1.0,
 }
 
 local function saveConfig()
@@ -37,6 +38,8 @@ local function loadConfig()
     if data then
         for k, v in pairs(data) do config[k] = v end
     end
+    -- ensure new fields exist if loading old config
+    if config.kD == nil then config.kD = 1.0 end
 end
 
 loadConfig()
@@ -48,6 +51,13 @@ local function clamp(n, lo, hi)
     if n < lo then return lo end
     if n > hi then return hi end
     return n
+end
+
+local function isValidPosition(p)
+    for _, pos in ipairs(POSITIONS) do
+        if pos == p then return true end
+    end
+    return false
 end
 
 local function status(msg, duration)
@@ -100,8 +110,7 @@ local function allOff()
     end
 end
 
--- Main view: shows live config / status. Re-rendered any time it could change.
-local function drawMain(extra)
+local function drawMain()
     term.redirect(mainWin)
     term.clear()
     term.setCursorPos(1, 1)
@@ -117,23 +126,102 @@ local function drawMain(extra)
     term.setCursorPos(1, 9)
     term.write(string.format("Hover power : %d", config.hoverPower))
     term.setCursorPos(1, 10)
-    term.write(string.format("Gain (kP)   : %.2f", config.kP))
+    term.write(string.format("Gain P (kP) : %.2f", config.kP))
     term.setCursorPos(1, 11)
+    term.write(string.format("Gain D (kD) : %.2f", config.kD))
+    term.setCursorPos(1, 12)
     term.write(string.format("Output side : %s", config.side))
 
-    term.setCursorPos(1, 13)
+    term.setCursorPos(1, 14)
     term.write("Type 'help' for commands.")
-
-    if extra then
-        term.setCursorPos(1, 15)
-        term.write(extra)
-    end
 
     term.redirect(term.native())
 end
 
+local function stabilize()
+    local gimbal = findGimbal()
+    if not gimbal then
+        status("No gimbal sensor found!", 2)
+        return
+    end
+
+    for pos, name in pairs(config.relays) do
+        if not name then
+            status("'" .. pos .. "' not set!", 2)
+            return
+        end
+    end
+
+    local lastPitch, lastRoll = 0, 0
+    local firstTick = true
+
+    local function drawStat(pitch, roll, pRate, rRate, fl, fr, bl, br)
+        term.redirect(mainWin)
+        term.clear()
+        term.setCursorPos(1, 1)
+        term.write("=== STABILIZING ===")
+        term.setCursorPos(1, 3)
+        term.write(string.format("Pitch (Z): %7.2f  rate %+6.2f", pitch, pRate))
+        term.setCursorPos(1, 4)
+        term.write(string.format("Roll  (X): %7.2f  rate %+6.2f", roll, rRate))
+        term.setCursorPos(1, 6)
+        term.write("Thrust output (0-15):")
+        term.setCursorPos(1, 7)
+        term.write(string.format("  FL: %2d   FR: %2d", fl, fr))
+        term.setCursorPos(1, 8)
+        term.write(string.format("  BL: %2d   BR: %2d", bl, br))
+        term.redirect(cmdWin)
+        term.clear()
+        term.setCursorPos(1, 1)
+        term.write("Press any key to stop")
+        term.redirect(term.native())
+    end
+
+    while true do
+        local timer = os.startTimer(0.05)
+        while true do
+            local event, p1 = os.pullEvent()
+            if event == "key" then
+                allOff()
+                status("Stopped.", 1)
+                return
+            elseif event == "timer" and p1 == timer then
+                break
+            end
+        end
+
+        local angles              = gimbal.getAngles()
+        local roll                = -angles[1] -- X axis, inverted
+        local pitch               = angles[2] -- Z axis
+
+        local pitchRate, rollRate = 0, 0
+        if not firstTick then
+            pitchRate = pitch - lastPitch
+            rollRate  = roll - lastRoll
+        end
+        firstTick = false
+        lastPitch = pitch
+        lastRoll  = roll
+
+        local pc  = (pitch * config.kP) + (pitchRate * config.kD)
+        local rc  = (roll * config.kP) + (rollRate * config.kD)
+
+        local fl  = clamp(math.floor(config.hoverPower - pc - rc + 0.5), 0, 15)
+        local fr  = clamp(math.floor(config.hoverPower - pc + rc + 0.5), 0, 15)
+        local bl  = clamp(math.floor(config.hoverPower + pc - rc + 0.5), 0, 15)
+        local br  = clamp(math.floor(config.hoverPower + pc + rc + 0.5), 0, 15)
+
+        setThrust(config.relays.front_left, fl)
+        setThrust(config.relays.front_right, fr)
+        setThrust(config.relays.back_left, bl)
+        setThrust(config.relays.back_right, br)
+
+        drawStat(pitch, roll, pitchRate, rollRate, fl, fr, bl, br)
+    end
+end
+
 -- ============================================================
--- Scrollable views (chest-browser pattern)
+-- Scrollable views
 -- ============================================================
 local function showHelp()
     local lines = {
@@ -148,7 +236,8 @@ local function showHelp()
         "                          back_left, back_right",
         "  pulse <pos>      - test a position",
         "  power <0-15>     - set hover power",
-        "  gain <number>    - set proportional gain",
+        "  gain <number>    - set P gain (kP)",
+        "  dgain <number>   - set D gain (kD)",
         "  side <up|down|.> - set output redstone side",
         "  start            - start stabilizer",
         "",
@@ -174,7 +263,6 @@ local function showRelays()
     local offset = 0
     local maxOff = math.max(0, #relays - (h - 2))
 
-    -- Find which relays are currently assigned (for marking)
     local assigned = {}
     for pos, name in pairs(config.relays) do
         if name then assigned[name] = pos end
@@ -262,79 +350,6 @@ local function listPeripherals()
 end
 
 -- ============================================================
--- Stabilizer (its own view)
--- ============================================================
-local function stabilize()
-    local gimbal = findGimbal()
-    if not gimbal then
-        status("No gimbal sensor found!", 2)
-        return
-    end
-
-    for pos, name in pairs(config.relays) do
-        if not name then
-            status("'" .. pos .. "' not set!", 2)
-            return
-        end
-    end
-
-    local function drawStat(pitch, roll, fl, fr, bl, br)
-        term.redirect(mainWin)
-        term.clear()
-        term.setCursorPos(1, 1)
-        term.write("=== STABILIZING ===")
-        term.setCursorPos(1, 3)
-        term.write(string.format("Pitch (Z): %7.2f", pitch))
-        term.setCursorPos(1, 4)
-        term.write(string.format("Roll  (X): %7.2f", roll))
-        term.setCursorPos(1, 6)
-        term.write("Thrust output (0-15):")
-        term.setCursorPos(1, 7)
-        term.write(string.format("  FL: %2d   FR: %2d", fl, fr))
-        term.setCursorPos(1, 8)
-        term.write(string.format("  BL: %2d   BR: %2d", bl, br))
-        term.redirect(cmdWin)
-        term.clear()
-        term.setCursorPos(1, 1)
-        term.write("Press any key to stop")
-        term.redirect(term.native())
-    end
-
-    while true do
-        local timer = os.startTimer(0.05)
-        while true do
-            local event, p1 = os.pullEvent()
-            if event == "key" then
-                allOff()
-                status("Stopped.", 1)
-                return
-            elseif event == "timer" and p1 == timer then
-                break
-            end
-        end
-
-        local angles = gimbal.getAngles()
-        local roll   = angles[1] -- X axis = left/right tilt
-        local pitch  = angles[2] -- Z axis = forward/back tilt
-
-        local pc     = pitch * config.kP
-        local rc     = -roll * config.kP
-
-        local fl     = clamp(math.floor(config.hoverPower - pc - rc + 0.5), 0, 15)
-        local fr     = clamp(math.floor(config.hoverPower - pc + rc + 0.5), 0, 15)
-        local bl     = clamp(math.floor(config.hoverPower + pc - rc + 0.5), 0, 15)
-        local br     = clamp(math.floor(config.hoverPower + pc + rc + 0.5), 0, 15)
-
-        setThrust(config.relays.front_left, fl)
-        setThrust(config.relays.front_right, fr)
-        setThrust(config.relays.back_left, bl)
-        setThrust(config.relays.back_right, br)
-
-        drawStat(pitch, roll, fl, fr, bl, br)
-    end
-end
-
--- ============================================================
 -- Commands
 -- ============================================================
 local function setRelay(pos, num)
@@ -375,20 +390,15 @@ local function handleCommand(cmd)
     elseif cmd == "list" then
         showRelays()
     elseif cmd == "show" then
-        -- main view already shows config; just refresh
         status("Config shown above.", 1)
     elseif cmd == "perf" then
         listPeripherals()
     elseif cmd == "start" then
         stabilize()
-    elseif cmd == "push" then
-        -- nothing here; placeholder for parity with chesty
     elseif cmd:match("^set ") then
         local a, b = cmd:match("^set (%S+) (%S+)$")
         local num = tonumber(b)
-        local validPos = {}
-        for _, p in ipairs(POSITIONS) do validPos[p] = true end
-        if not a or not validPos[a] then
+        if not a or not isValidPosition(a) then
             status("Unknown pos. front_left/right, back_left/right", 2)
         elseif not num then
             status("Need a number. Use 'list'.", 2)
@@ -397,7 +407,7 @@ local function handleCommand(cmd)
         end
     elseif cmd:match("^pulse ") then
         local a = cmd:match("^pulse (%S+)$")
-        if not a or not config.relays[a] then
+        if not a or not isValidPosition(a) then
             status("Unknown pos.", 2)
         else
             pulse(a)
@@ -420,6 +430,15 @@ local function handleCommand(cmd)
         else
             status("Usage: gain <number>", 2)
         end
+    elseif cmd:match("^dgain ") then
+        local n = tonumber(cmd:match("^dgain (%S+)$"))
+        if n then
+            config.kD = n
+            saveConfig()
+            status("kD: " .. config.kD, 1)
+        else
+            status("Usage: dgain <number>", 2)
+        end
     elseif cmd:match("^side ") then
         local s = cmd:match("^side (%S+)$")
         if s then
@@ -436,7 +455,7 @@ local function handleCommand(cmd)
 end
 
 -- ============================================================
--- Main loop (chest-browser style)
+-- Main loop
 -- ============================================================
 local cmdInput = ""
 
